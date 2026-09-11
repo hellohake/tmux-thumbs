@@ -16,7 +16,7 @@ pub struct View<'a> {
   multi: bool,
   contrast: bool,
   position: &'a str,
-  matches: Vec<state::Match<'a>>,
+  matches: Vec<state::Match>,
   select_foreground_color: Box<dyn color::Color>,
   select_background_color: Box<dyn color::Color>,
   multi_foreground_color: Box<dyn color::Color>,
@@ -106,7 +106,7 @@ impl<'a> View<'a> {
     let selected = self.matches.get(self.skip);
 
     for mat in self.matches.iter() {
-      let chosen_hint = self.chosen.iter().any(|(hint, _)| hint == mat.text);
+      let chosen_hint = self.chosen.iter().any(|(hint, _)| hint == &mat.text);
 
       let selected_color = if chosen_hint {
         &self.multi_foreground_color
@@ -124,15 +124,16 @@ impl<'a> View<'a> {
       };
 
       // Find long utf sequences and extract it from mat.x
-      let line = &self.state.lines[mat.y as usize];
-      let prefix = &line[0..mat.x as usize];
+      let anchor = mat.anchor();
+      let line = &self.state.lines[anchor.line];
+      let prefix = &line[0..anchor.start];
       let extra = prefix.width_cjk() - prefix.chars().count();
-      let offset = (mat.x as u16) - (extra as u16);
-      let text = self.make_hint_text(mat.text);
+      let offset = (anchor.start as u16) - (extra as u16);
+      let text = self.make_hint_text(&mat.text);
 
       print!(
         "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-        goto = cursor::Goto(offset + 1, mat.y as u16 + 1),
+        goto = cursor::Goto(offset + 1, anchor.line as u16 + 1),
         foregroud = color::Fg(&**selected_color),
         background = color::Bg(&**selected_background_color),
         resetf = color::Fg(color::Reset),
@@ -153,7 +154,7 @@ impl<'a> View<'a> {
 
         print!(
           "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-          goto = cursor::Goto(final_position as u16 + 1, mat.y as u16 + 1),
+          goto = cursor::Goto(final_position as u16 + 1, anchor.line as u16 + 1),
           foregroud = color::Fg(&*self.hint_foreground_color),
           background = color::Bg(&*self.hint_background_color),
           resetf = color::Fg(color::Reset),
@@ -164,7 +165,7 @@ impl<'a> View<'a> {
         if hint.starts_with(typed_hint) {
           print!(
             "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-            goto = cursor::Goto(final_position as u16 + 1, mat.y as u16 + 1),
+            goto = cursor::Goto(final_position as u16 + 1, anchor.line as u16 + 1),
             foregroud = color::Fg(&*self.multi_foreground_color),
             background = color::Bg(&*self.multi_background_color),
             resetf = color::Fg(color::Reset),
@@ -320,7 +321,7 @@ mod tests {
   fn hint_text() {
     let lines = split("lorem 127.0.0.1 lorem");
     let custom = [].to_vec();
-    let mut state = state::State::new(&lines, "abcd", &custom);
+    let mut state = state::State::new(&lines, "abcd", &custom, None);
     let mut view = View {
       state: &mut state,
       skip: 0,

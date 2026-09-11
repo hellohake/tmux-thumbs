@@ -172,7 +172,7 @@ fn main() {
 
   let lines = output.split('\n').collect::<Vec<&str>>();
 
-  let mut state = state::State::new(&lines, alphabet, &regexp);
+  let mut state = state::State::new(&lines, alphabet, &regexp, None);
 
   let selected = {
     let mut viewbox = view::View::new(
