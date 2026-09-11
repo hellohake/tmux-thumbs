@@ -7,6 +7,7 @@ extern crate termion;
 mod alphabets;
 mod colors;
 mod state;
+mod url_path;
 mod view;
 
 use self::clap::{App, Arg};

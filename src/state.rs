@@ -5,7 +5,10 @@ const EXCLUDE_PATTERNS: [(&'static str, &'static str); 1] = [("bash", r"[[:cntrl
 
 const PATTERNS: [(&'static str, &'static str); 15] = [
   ("markdown_url", r"\[[^]]*\]\(([^)]+)\)"),
-  ("url", r"(?P<match>(https?://|git@|git://|ssh://|ftp://|file:///)[^ ]+)"),
+  (
+    "url",
+    r"(?P<match>(https?://|git@|git://|ssh://|ftp://|file:///)[\x21-\x7e]+)",
+  ),
   (
     "diff_summary",
     r"diff --git a/([.\w\-@~\[\]]+?/[.\w\-@\[\]]++) b/([.\w\-@~\[\]]+?/[.\w\-@\[\]]++)",
@@ -13,7 +16,10 @@ const PATTERNS: [(&'static str, &'static str); 15] = [
   ("diff_a", r"--- a/([^ ]+)"),
   ("diff_b", r"\+\+\+ b/([^ ]+)"),
   ("docker", r"sha256:([0-9a-f]{64})"),
-  ("path", r"(?P<match>([.\w\-@$~\[\]]+)?(/[.\w\-@$\[\]]+)+)"),
+  (
+    "path",
+    r"(?P<match>([.\w\-@$~%+\[\]()]*)?(/[.\w\-@$~%+\[\]()]*)+(?::\d+(?::\d+)?)?)",
+  ),
   ("color", r"#[0-9a-fA-F]{6}"),
   ("uid", r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"),
   ("ipfs", r"Qm[0-9a-zA-Z]{44}"),
@@ -157,6 +163,8 @@ impl<'a> State<'a> {
       }
     }
 
+    let mut matches = super::url_path::normalize(self.lines, matches, self.pane_width);
+
     let alphabet = super::alphabets::get_alphabet(self.alphabet);
     let mut hints = alphabet.hints(matches.len());
 
@@ -264,7 +272,7 @@ mod tests {
 
     assert_eq!(results.len(), 3);
     assert_eq!(results.get(0).unwrap().text, "/var/log/nginx.log");
-    assert_eq!(results.get(1).unwrap().text, "test/log/nginx-2.log");
+    assert_eq!(results.get(1).unwrap().text, "test/log/nginx-2.log:32");
     assert_eq!(results.get(2).unwrap().text, "folder/.nginx@4df2.log");
   }
 
