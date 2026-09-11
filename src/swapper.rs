@@ -5,6 +5,7 @@ use clap::crate_version;
 use regex::Regex;
 use std::io::Write;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 trait Executor {
@@ -41,7 +42,7 @@ impl Executor for RealShell {
   }
 }
 
-const TMP_FILE: &str = "/tmp/thumbs-last";
+static INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[allow(dead_code)]
 fn dbg(msg: &str) {
@@ -70,6 +71,7 @@ pub struct Swapper<'a> {
   thumbs_pane_id: Option<String>,
   content: Option<String>,
   signal: String,
+  tmp_file: String,
 }
 
 impl<'a> Swapper<'a> {
@@ -84,7 +86,14 @@ impl<'a> Swapper<'a> {
     let since_the_epoch = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .expect("Time went backwards");
-    let signal = format!("thumbs-finished-{}", since_the_epoch.as_secs());
+    let instance = format!(
+      "{}-{}-{}",
+      std::process::id(),
+      since_the_epoch.as_nanos(),
+      INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let signal = format!("thumbs-finished-{}", instance);
+    let tmp_file = format!("/tmp/thumbs-last-{}", instance);
 
     Swapper {
       executor,
@@ -101,6 +110,7 @@ impl<'a> Swapper<'a> {
       thumbs_pane_id: None,
       content: None,
       signal,
+      tmp_file,
     }
   }
 
@@ -236,7 +246,7 @@ impl<'a> Swapper<'a> {
         scroll_params = scroll_params,
         height = self.active_pane_height.unwrap_or(i32::MAX),
         dir = self.dir,
-        tmp = TMP_FILE,
+        tmp = self.tmp_file,
         pane_width_param = pane_width_param,
         args = args.join(" "),
         zoom_command = zoom_command,
@@ -311,14 +321,14 @@ impl<'a> Swapper<'a> {
   }
 
   pub fn retrieve_content(&mut self) {
-    let retrieve_command = vec!["cat", TMP_FILE];
+    let retrieve_command = vec!["cat", self.tmp_file.as_str()];
     let params = retrieve_command.iter().map(|arg| arg.to_string()).collect();
 
     self.content = Some(self.executor.execute(params));
   }
 
   pub fn destroy_content(&mut self) {
-    let retrieve_command = vec!["rm", TMP_FILE];
+    let retrieve_command = vec!["rm", self.tmp_file.as_str()];
     let params = retrieve_command.iter().map(|arg| arg.to_string()).collect();
 
     self.executor.execute(params);
@@ -498,6 +508,45 @@ mod tests {
 
     let command = executor.last_executed().unwrap();
     assert!(command.last().unwrap().contains("--pane-width 120"));
+  }
+
+  #[test]
+  fn concurrent_swappers_use_unique_runtime_names() {
+    let mut first_executor = TestShell::new(vec!["%100".to_string(), "".to_string()]);
+    let mut second_executor = TestShell::new(vec!["%101".to_string(), "".to_string()]);
+    let mut first = Swapper::new(
+      Box::new(&mut first_executor),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+    first.active_pane_id = Some("%97".to_string());
+    first.active_pane_height = Some(24);
+    first.active_pane_width = Some(120);
+    first.active_pane_zoomed = Some(false);
+    first.execute_thumbs();
+    let first_command = first_executor.last_executed().unwrap().last().unwrap().clone();
+
+    let mut second = Swapper::new(
+      Box::new(&mut second_executor),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+    second.active_pane_id = Some("%98".to_string());
+    second.active_pane_height = Some(24);
+    second.active_pane_width = Some(120);
+    second.active_pane_zoomed = Some(false);
+    second.execute_thumbs();
+    let second_command = second_executor.last_executed().unwrap().last().unwrap().clone();
+
+    assert!(first_command.contains("/tmp/thumbs-last-"));
+    assert!(second_command.contains("/tmp/thumbs-last-"));
+    assert_ne!(first_command, second_command);
   }
 
   #[test]

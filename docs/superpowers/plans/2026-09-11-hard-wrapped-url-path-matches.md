@@ -338,4 +338,3 @@ git commit -m "test: cover hard-wrapped candidates in tmux"
 - [ ] **Step 6: Perform independent review**
 
 Invoke `superpowers:requesting-code-review`. Review priority regressions, byte/column confusion, Unicode boundaries, false joins, hint duplication, and accidental live configuration changes. Address accepted findings through failing tests first.
-

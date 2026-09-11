@@ -6,6 +6,7 @@ SOCKET_NAME="tmux-thumbs-hard-wrap-$$"
 SESSION_NAME="hard-wrap"
 CAPTURE_FILE="$(mktemp /tmp/tmux-thumbs-hard-wrap-capture.XXXXXX)"
 EXPECTED='.ai_doc/records/inbox/life-card-admin-20260911-01a08c45/handoff.md'
+EXPECTED_URL='https://host/a'
 
 cleanup() {
   tmux -L "${SOCKET_NAME}" kill-server 2>/dev/null || true
@@ -87,5 +88,20 @@ buffer_matches() {
 }
 wait_until 'normalized tmux buffer' buffer_matches
 
-printf 'hard-wrap tmux test: ok\n'
+source_pane_is_restored() {
+  test "$(tmux -L "${SOCKET_NAME}" list-panes -t "${SOURCE_WINDOW}" -F '#{pane_id}')" = "${SOURCE_PANE}"
+}
+wait_until 'source pane restoration' source_pane_is_restored
 
+tmux -L "${SOCKET_NAME}" run-shell -b -t "${SOURCE_PANE}" \
+  "${ROOT_DIR}/target/release/tmux-thumbs --dir '${ROOT_DIR}'"
+wait_until 'second thumbs pane' thumbs_is_running
+THUMBS_PANE="$(tmux -L "${SOCKET_NAME}" list-panes -t "${SOURCE_WINDOW}" -F '#{pane_id}')"
+tmux -L "${SOCKET_NAME}" send-keys -t "${THUMBS_PANE}" b
+
+url_buffer_matches() {
+  test "$(tmux -L "${SOCKET_NAME}" show-buffer 2>/dev/null || true)" = "${EXPECTED_URL}"
+}
+wait_until 'URL buffer without adjacent Chinese prose' url_buffer_matches
+
+printf 'hard-wrap tmux test: ok\n'
