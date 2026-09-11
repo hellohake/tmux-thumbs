@@ -55,7 +55,7 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize) -> Optio
 
   loop {
     let current = *lines.get(current_line)?;
-    restore_path_location_separator(current, &mut joined);
+    restore_join_separator(current, &mut joined);
     let current_span = joined.spans.last().unwrap();
     if !reaches_pane_edge(current, current_span, pane_width) {
       break;
@@ -91,15 +91,22 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize) -> Optio
   Some(joined)
 }
 
-fn restore_path_location_separator(line: &str, candidate: &mut Match) {
-  if candidate.pattern != "path" || candidate.text.ends_with(':') {
+fn restore_join_separator(line: &str, candidate: &mut Match) {
+  if candidate.text.ends_with('.') || candidate.text.ends_with(':') {
     return;
   }
 
   let span = candidate.spans.last_mut().unwrap();
-  if line[span.end..].starts_with(':') {
-    span.end += 1;
-    candidate.text.push(':');
+  let separator = line[span.end..].chars().next();
+  let should_restore = match separator {
+    Some('.') => true,
+    Some(':') => candidate.pattern == "path",
+    _ => false,
+  };
+  if should_restore {
+    let separator = separator.unwrap();
+    span.end += separator.len_utf8();
+    candidate.text.push(separator);
   }
 }
 
@@ -123,7 +130,7 @@ fn continuation_span(pattern: &str, line: &str, _accumulated: &str) -> Option<Sc
   let remainder = &trimmed[end_in_trimmed..];
 
   let token = &trimmed[..end_in_trimmed];
-  if remainder.starts_with(char::is_whitespace) && !has_path_structure(token) {
+  if remainder.starts_with(char::is_whitespace) && !has_strong_path_structure(token) {
     return None;
   }
 
@@ -176,6 +183,10 @@ fn has_path_structure(text: &str) -> bool {
   text
     .chars()
     .any(|ch| matches!(ch, '/' | ':' | '.' | '-' | '_' | '=' | '?' | '&' | '#' | '%'))
+}
+
+fn has_strong_path_structure(text: &str) -> bool {
+  text.chars().any(|ch| matches!(ch, '/' | '.' | ':'))
 }
 
 fn is_meaningful_path(text: &str) -> bool {
@@ -303,7 +314,7 @@ fn is_terminal_punctuation(ch: char, pattern: &str, text: &str) -> bool {
           .map(|(_, suffix)| !suffix.is_empty())
           .unwrap_or(false)
     }
-    '?' => pattern != "url" || !text.contains('?'),
+    '?' => pattern != "url" || text.ends_with('?'),
     _ => false,
   }
 }
@@ -364,6 +375,12 @@ mod tests {
       "https://github.com/fcsonline/tmux-thumbs/releases/tag/0.8.0",
       "（".len(),
     );
+  }
+
+  #[test]
+  fn url_trims_a_sentence_question_mark_but_keeps_a_query() {
+    assert_url("https://host/path?", "https://host/path", 0);
+    assert_url("https://host/path?q=value", "https://host/path?q=value", 0);
   }
 
   #[test]
@@ -450,6 +467,19 @@ mod tests {
   }
 
   #[test]
+  fn joins_after_a_dot_trimmed_by_single_line_normalization() {
+    let cases = [
+      ("path/file.\n  ext", "path", "path/file.ext"),
+      ("https://example.\n  com/path", "url", "https://example.com/path"),
+    ];
+
+    for (input, pattern, expected) in cases {
+      let candidate = matching_with_width(input, pattern, Some(pane_width(input)));
+      assert_eq!(candidate.text, expected, "input: {:?}", input);
+    }
+  }
+
+  #[test]
   fn does_not_join_blocked_or_ambiguous_continuations() {
     let cases = [
       "path/to/\n  /another/independent/path",
@@ -458,6 +488,7 @@ mod tests {
       "path/to/\n  $ shell prompt",
       "path/to/\n  https://new.example/path",
       "path/to/\n  natural language continues here",
+      "path/to/\n  natural-language continues here",
       "path/to/\n\n  next/file.rs",
       "path/to/\nnext/file.rs",
     ];
