@@ -137,7 +137,19 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .short("t")
         .takes_value(true),
     )
+    .arg(
+      Arg::with_name("pane_width")
+        .help("Sets the source tmux pane width for hard-wrap detection")
+        .long("pane-width")
+        .takes_value(true),
+    )
     .get_matches()
+}
+
+fn parse_pane_width(value: Option<&str>) -> Option<usize> {
+  value
+    .and_then(|value| value.parse::<usize>().ok())
+    .filter(|width| *width > 0)
 }
 
 fn main() {
@@ -150,6 +162,7 @@ fn main() {
   let reverse = args.is_present("reverse");
   let unique = args.is_present("unique");
   let contrast = args.is_present("contrast");
+  let pane_width = parse_pane_width(args.value_of("pane_width"));
   let regexp = if let Some(items) = args.values_of("regexp") {
     items.collect::<Vec<_>>()
   } else {
@@ -173,7 +186,7 @@ fn main() {
 
   let lines = output.split('\n').collect::<Vec<&str>>();
 
-  let mut state = state::State::new(&lines, alphabet, &regexp, None);
+  let mut state = state::State::new(&lines, alphabet, &regexp, pane_width);
 
   let selected = {
     let mut viewbox = view::View::new(
@@ -225,5 +238,18 @@ fn main() {
     }
   } else {
     ::std::process::exit(1);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn pane_width_parser_rejects_missing_zero_and_invalid_values() {
+    assert_eq!(parse_pane_width(None), None);
+    assert_eq!(parse_pane_width(Some("0")), None);
+    assert_eq!(parse_pane_width(Some("invalid")), None);
+    assert_eq!(parse_pane_width(Some("120")), Some(120));
   }
 }
