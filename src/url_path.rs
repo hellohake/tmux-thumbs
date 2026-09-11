@@ -56,11 +56,6 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize) -> Optio
   loop {
     let current = *lines.get(current_line)?;
     restore_join_separator(current, &mut joined);
-    let current_span = joined.spans.last().unwrap();
-    if !reaches_pane_edge(current, current_span, pane_width) {
-      break;
-    }
-
     let next_line = current_line + 1;
     let next = match lines.get(next_line) {
       Some(next) => *next,
@@ -74,6 +69,10 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize) -> Optio
       None => break,
     };
     let token = &next[span.start..span.end];
+    let current_span = joined.spans.last().unwrap();
+    if !reaches_wrap_boundary(current, current_span, token, pane_width) {
+      break;
+    }
     if !is_confident_continuation(joined.pattern, &joined.text, token) {
       break;
     }
@@ -110,14 +109,16 @@ fn restore_join_separator(line: &str, candidate: &mut Match) {
   }
 }
 
-fn reaches_pane_edge(line: &str, span: &ScreenSpan, pane_width: usize) -> bool {
+fn reaches_wrap_boundary(line: &str, span: &ScreenSpan, continuation: &str, pane_width: usize) -> bool {
   let visible_end = line.trim_end_matches(char::is_whitespace).len();
-  span.end == visible_end && line.width_cjk() >= pane_width
+  span.end == visible_end
+    && (line.width_cjk() >= pane_width
+      || (has_strong_path_structure(continuation) && line.width_cjk() + continuation.width_cjk() > pane_width))
 }
 
-fn continuation_span(pattern: &str, line: &str, _accumulated: &str) -> Option<ScreenSpan> {
+fn continuation_span(pattern: &str, line: &str, accumulated: &str) -> Option<ScreenSpan> {
   let trimmed = line.trim_start_matches(char::is_whitespace);
-  if trimmed.len() == line.len() || trimmed.is_empty() || is_blocked_continuation(pattern, trimmed) {
+  if trimmed.len() == line.len() || trimmed.is_empty() || is_blocked_continuation(pattern, trimmed, accumulated) {
     return None;
   }
 
@@ -141,7 +142,7 @@ fn continuation_span(pattern: &str, line: &str, _accumulated: &str) -> Option<Sc
   })
 }
 
-fn is_blocked_continuation(pattern: &str, text: &str) -> bool {
+fn is_blocked_continuation(pattern: &str, text: &str, accumulated: &str) -> bool {
   let blocked_prefixes = ["- ", "* ", "+ ", "◆", "•", "$ ", "# ", "> ", "% "];
   if blocked_prefixes.iter().any(|prefix| text.starts_with(prefix)) {
     return true;
@@ -154,8 +155,23 @@ fn is_blocked_continuation(pattern: &str, text: &str) -> bool {
     return true;
   }
 
-  pattern == "path"
-    && (text.starts_with('/') || text.starts_with("~/") || text.starts_with("./") || text.starts_with("../"))
+  if pattern != "path" {
+    return false;
+  }
+
+  if text.starts_with('/') {
+    return accumulated.ends_with('/') || path_looks_complete(accumulated);
+  }
+
+  text.starts_with("~/") || text.starts_with("./") || text.starts_with("../")
+}
+
+fn path_looks_complete(path: &str) -> bool {
+  let component = path.rsplit('/').next().unwrap_or(path);
+  component
+    .rfind('.')
+    .map(|index| index > 0 && index + 1 < component.len())
+    .unwrap_or(false)
 }
 
 fn is_candidate_char(pattern: &str, ch: char) -> bool {
@@ -165,7 +181,7 @@ fn is_candidate_char(pattern: &str, ch: char) -> bool {
     ch.is_ascii_alphanumeric()
       || matches!(
         ch,
-        '.' | '_' | '-' | '@' | '$' | '~' | '%' | '+' | '[' | ']' | '(' | ')' | '/' | ':'
+        '.' | '_' | '-' | '@' | '$' | '~' | '%' | '+' | '*' | '[' | ']' | '(' | ')' | '/' | ':'
       )
   }
 }
@@ -395,6 +411,11 @@ mod tests {
   }
 
   #[test]
+  fn path_glob_is_one_candidate() {
+    assert_path("specs/**/*.md 与 grill-spec.md", "specs/**/*.md", 0);
+  }
+
+  #[test]
   fn path_excludes_outer_parentheses() {
     assert_path(
       "(.ai_doc/records/inbox/handoff.md)。",
@@ -480,6 +501,50 @@ mod tests {
   }
 
   #[test]
+  fn joins_tui_word_wrapped_paths_before_the_pane_edge() {
+    let base = "/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_card_admin/openspec/changes/";
+    let cases = [
+      (
+        format!(
+          "      - {}life-service-card-admin-compatibility\n        /proposal.md：明确使用",
+          base
+        ),
+        format!("{}life-service-card-admin-compatibility/proposal.md", base),
+      ),
+      (
+        format!(
+          "      - {}life-service-card-admin-\n        compatibility/design.md：命令实际解析",
+          base
+        ),
+        format!("{}life-service-card-admin-compatibility/design.md", base),
+      ),
+      (
+        format!(
+          "  - {}life-service-card-admin-compatibility/\n    revise.md 已恢复",
+          base
+        ),
+        format!("{}life-service-card-admin-compatibility/revise.md", base),
+      ),
+    ];
+
+    for (input, expected) in cases {
+      let candidate = matching_with_width(&input, "path", Some(136));
+      assert_eq!(candidate.text, expected, "input: {:?}", input);
+      assert_eq!(candidate.spans.len(), 2, "input: {:?}", input);
+    }
+  }
+
+  #[test]
+  fn does_not_join_a_complete_file_with_an_independent_rooted_path() {
+    let input = "  - /workspace/complete.md\n    /another/independent.md";
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let custom = vec![];
+    let results = State::new(&lines, "abcd", &custom, Some(pane_width(input))).matches(false, false);
+
+    assert!(results.iter().all(|candidate| candidate.spans.len() == 1));
+  }
+
+  #[test]
   fn does_not_join_blocked_or_ambiguous_continuations() {
     let cases = [
       "path/to/\n  /another/independent/path",
@@ -513,7 +578,7 @@ mod tests {
     let custom = vec![];
 
     let without_width = State::new(&lines, "abcd", &custom, None).matches(false, false);
-    let before_edge = State::new(&lines, "abcd", &custom, Some(pane_width(input) + 1)).matches(false, false);
+    let before_edge = State::new(&lines, "abcd", &custom, Some(80)).matches(false, false);
 
     assert!(without_width.iter().all(|candidate| candidate.spans.len() == 1));
     assert!(before_edge.iter().all(|candidate| candidate.spans.len() == 1));

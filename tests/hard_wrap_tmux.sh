@@ -104,4 +104,60 @@ url_buffer_matches() {
 }
 wait_until 'URL buffer without adjacent Chinese prose' url_buffer_matches
 
+run_path_case() {
+  local session_name="$1"
+  local first_line="$2"
+  local second_line="$3"
+  local expected="$4"
+  local source_command source_pane source_window thumbs_pane
+
+  printf -v source_command \
+    "bash -c %q" \
+    "printf '\033[?7l\033[H\033[2J%s\033[2;1H%s\033[?7h' '${first_line}' '${second_line}'; exec sleep 120"
+  tmux -L "${SOCKET_NAME}" new-session -d -x 136 -y 8 -s "${session_name}" "${source_command}"
+  source_pane="$(tmux -L "${SOCKET_NAME}" display-message -p -t "${session_name}:" '#{pane_id}')"
+  source_window="$(tmux -L "${SOCKET_NAME}" display-message -p -t "${source_pane}" '#{window_id}')"
+
+  tmux -L "${SOCKET_NAME}" run-shell -b -t "${source_pane}" \
+    "${ROOT_DIR}/target/release/tmux-thumbs --dir '${ROOT_DIR}'"
+  for _ in $(seq 1 100); do
+    thumbs_pane="$(tmux -L "${SOCKET_NAME}" list-panes -t "${source_window}" -F '#{pane_id}')"
+    if test "${thumbs_pane}" != "${source_pane}"; then
+      break
+    fi
+    sleep 0.05
+  done
+  test "${thumbs_pane}" != "${source_pane}" || fail "timed out waiting for ${session_name} thumbs pane"
+
+  tmux -L "${SOCKET_NAME}" capture-pane -p -t "${thumbs_pane}" >"${CAPTURE_FILE}"
+  test "$(rg -o '\[a\]' "${CAPTURE_FILE}" | wc -l)" -eq 1 || fail "${session_name} does not have one logical hint"
+  tmux -L "${SOCKET_NAME}" send-keys -t "${thumbs_pane}" a
+
+  for _ in $(seq 1 100); do
+    if test "$(tmux -L "${SOCKET_NAME}" show-buffer 2>/dev/null || true)" = "${expected}"; then
+      tmux -L "${SOCKET_NAME}" kill-session -t "${session_name}"
+      return 0
+    fi
+    sleep 0.05
+  done
+  fail "${session_name} copied an incomplete path"
+}
+
+BASE='/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_card_admin/openspec/changes/'
+run_path_case \
+  'exact-edge' \
+  "      - ${BASE}life-service-card-admin-compatibility" \
+  '        /proposal.md：明确使用' \
+  "${BASE}life-service-card-admin-compatibility/proposal.md"
+run_path_case \
+  'word-boundary' \
+  "      - ${BASE}life-service-card-admin-" \
+  '        compatibility/design.md：命令实际解析版本为权威' \
+  "${BASE}life-service-card-admin-compatibility/design.md"
+run_path_case \
+  'glob' \
+  'specs/**/*.md 与 grill-spec.md 已复核' \
+  '' \
+  'specs/**/*.md'
+
 printf 'hard-wrap tmux test: ok\n'
