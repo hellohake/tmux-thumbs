@@ -7,6 +7,7 @@ pub fn normalize(lines: &[&str], mut matches: Vec<Match>, pane_width: Option<usi
       trim_candidate(candidate);
     }
   }
+  matches.retain(|candidate| candidate.pattern != "path" || is_meaningful_path(&candidate.text));
 
   let width = match pane_width.filter(|width| *width > 0) {
     Some(width) => width,
@@ -53,8 +54,9 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize) -> Optio
   let mut current_line = candidate.anchor().line;
 
   loop {
-    let current_span = joined.spans.last().unwrap();
     let current = *lines.get(current_line)?;
+    restore_path_location_separator(current, &mut joined);
+    let current_span = joined.spans.last().unwrap();
     if !reaches_pane_edge(current, current_span, pane_width) {
       break;
     }
@@ -89,6 +91,18 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize) -> Optio
   Some(joined)
 }
 
+fn restore_path_location_separator(line: &str, candidate: &mut Match) {
+  if candidate.pattern != "path" || candidate.text.ends_with(':') {
+    return;
+  }
+
+  let span = candidate.spans.last_mut().unwrap();
+  if line[span.end..].starts_with(':') {
+    span.end += 1;
+    candidate.text.push(':');
+  }
+}
+
 fn reaches_pane_edge(line: &str, span: &ScreenSpan, pane_width: usize) -> bool {
   let visible_end = line.trim_end_matches(char::is_whitespace).len();
   span.end == visible_end && line.width_cjk() >= pane_width
@@ -108,7 +122,8 @@ fn continuation_span(pattern: &str, line: &str, _accumulated: &str) -> Option<Sc
     .map(|(index, ch)| index + ch.len_utf8())?;
   let remainder = &trimmed[end_in_trimmed..];
 
-  if remainder.starts_with(char::is_whitespace) {
+  let token = &trimmed[..end_in_trimmed];
+  if remainder.starts_with(char::is_whitespace) && !has_path_structure(token) {
     return None;
   }
 
@@ -154,9 +169,17 @@ fn is_confident_continuation(_pattern: &str, accumulated: &str, token: &str) -> 
     .last()
     .map(|ch| matches!(ch, '/' | ':' | '.' | '-' | '_' | '=' | '?' | '&' | '#' | '%'))
     .unwrap_or(false)
-    || token
-      .chars()
-      .any(|ch| matches!(ch, '/' | ':' | '.' | '-' | '_' | '=' | '?' | '&' | '#' | '%'))
+    || has_path_structure(token)
+}
+
+fn has_path_structure(text: &str) -> bool {
+  text
+    .chars()
+    .any(|ch| matches!(ch, '/' | ':' | '.' | '-' | '_' | '=' | '?' | '&' | '#' | '%'))
+}
+
+fn is_meaningful_path(text: &str) -> bool {
+  text.chars().any(|ch| ch != '/')
 }
 
 fn overlaps(candidate: &Match, other: &Match) -> bool {
@@ -188,7 +211,7 @@ fn trim_candidate(candidate: &mut Match) {
 
 fn boundary_range(text: &str, pattern: &str) -> (usize, usize) {
   let mut start = 0;
-  let mut end = text.len();
+  let mut end = trim_terminal_punctuation(text, pattern);
 
   loop {
     let bounded = &text[start..end];
@@ -207,6 +230,18 @@ fn boundary_range(text: &str, pattern: &str) -> (usize, usize) {
 
   let bounded_len = boundary_len(&text[start..end], pattern);
   (start, start + bounded_len)
+}
+
+fn trim_terminal_punctuation(text: &str, pattern: &str) -> usize {
+  let mut bounded = text;
+  while let Some(ch) = bounded.chars().last() {
+    if is_terminal_punctuation(ch, pattern, bounded) {
+      bounded = &bounded[..bounded.len() - ch.len_utf8()];
+    } else {
+      break;
+    }
+  }
+  bounded.len()
 }
 
 fn boundary_len(text: &str, pattern: &str) -> usize {
@@ -228,16 +263,7 @@ fn boundary_len(text: &str, pattern: &str) -> usize {
     }
   }
 
-  let mut bounded = &text[..end];
-  while let Some(ch) = bounded.chars().last() {
-    if is_terminal_punctuation(ch, pattern, bounded) {
-      bounded = &bounded[..bounded.len() - ch.len_utf8()];
-    } else {
-      break;
-    }
-  }
-
-  bounded.len()
+  trim_terminal_punctuation(&text[..end], pattern)
 }
 
 fn matching_close_at_end(text: &str, first: char) -> bool {
@@ -270,6 +296,13 @@ fn closes(open: char, close: char) -> bool {
 fn is_terminal_punctuation(ch: char, pattern: &str, text: &str) -> bool {
   match ch {
     '，' | '。' | '；' | '：' | '！' | '、' | ',' | '.' | ';' | '!' => true,
+    ':' => {
+      pattern == "path"
+        && !text
+          .rsplit_once(':')
+          .map(|(_, suffix)| !suffix.is_empty())
+          .unwrap_or(false)
+    }
     '?' => pattern != "url" || !text.contains('?'),
     _ => false,
   }
@@ -351,6 +384,21 @@ mod tests {
       ".ai_doc/records/inbox/handoff.md",
       1,
     );
+    assert_path("(path/file.md).", "path/file.md", 1);
+  }
+
+  #[test]
+  fn path_excludes_a_dangling_location_colon() {
+    assert_path("path/file.go:", "path/file.go", 0);
+  }
+
+  #[test]
+  fn standalone_slash_is_not_a_path_candidate() {
+    let lines = vec!["use / to separate alternatives"];
+    let custom = vec![];
+    let matches = State::new(&lines, "abcd", &custom, None).matches(false, false);
+
+    assert!(matches.iter().all(|candidate| candidate.pattern != "path"));
   }
 
   #[test]
@@ -390,6 +438,15 @@ mod tests {
 
     assert_eq!(candidate.text, "https://example.com/a/long-path-segment/bb/final.html");
     assert_eq!(candidate.spans.len(), 3);
+  }
+
+  #[test]
+  fn joins_filename_before_following_prose() {
+    let input = "path/to/\n  file.md 后续文字";
+    let candidate = matching_with_width(input, "path", Some(pane_width(input)));
+
+    assert_eq!(candidate.text, "path/to/file.md");
+    assert_eq!(candidate.spans.len(), 2);
   }
 
   #[test]
