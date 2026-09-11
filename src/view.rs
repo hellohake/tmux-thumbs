@@ -92,6 +92,10 @@ impl<'a> View<'a> {
     }
   }
 
+  fn display_column(line: &str, byte_offset: usize) -> u16 {
+    line[..byte_offset].width_cjk() as u16 + 1
+  }
+
   fn render(&self, stdout: &mut dyn Write, typed_hint: &str) -> () {
     write!(stdout, "{}", cursor::Hide).unwrap();
 
@@ -99,7 +103,13 @@ impl<'a> View<'a> {
       let clean = line.trim_end_matches(|c: char| c.is_whitespace());
 
       if !clean.is_empty() {
-        print!("{goto}{text}", goto = cursor::Goto(1, index as u16 + 1), text = line);
+        write!(
+          stdout,
+          "{goto}{text}",
+          goto = cursor::Goto(1, index as u16 + 1),
+          text = line
+        )
+        .unwrap();
       }
     }
 
@@ -123,55 +133,66 @@ impl<'a> View<'a> {
         &self.background_color
       };
 
-      // Find long utf sequences and extract it from mat.x
-      let anchor = mat.anchor();
-      let line = &self.state.lines[anchor.line];
-      let prefix = &line[0..anchor.start];
-      let extra = prefix.width_cjk() - prefix.chars().count();
-      let offset = (anchor.start as u16) - (extra as u16);
-      let text = self.make_hint_text(&mat.text);
+      for span in mat.spans.iter() {
+        let line = &self.state.lines[span.line];
+        let text = &line[span.start..span.end];
 
-      print!(
-        "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-        goto = cursor::Goto(offset + 1, anchor.line as u16 + 1),
-        foregroud = color::Fg(&**selected_color),
-        background = color::Bg(&**selected_background_color),
-        resetf = color::Fg(color::Reset),
-        resetb = color::Bg(color::Reset),
-        text = &text
-      );
+        write!(
+          stdout,
+          "{goto}{background}{foregroud}{text}{resetf}{resetb}",
+          goto = cursor::Goto(Self::display_column(line, span.start), span.line as u16 + 1),
+          foregroud = color::Fg(&**selected_color),
+          background = color::Bg(&**selected_background_color),
+          resetf = color::Fg(color::Reset),
+          resetb = color::Bg(color::Reset),
+          text = text
+        )
+        .unwrap();
+      }
 
       if let Some(ref hint) = mat.hint {
+        let anchor = match self.position {
+          "right" | "off_right" => mat.spans.last().unwrap(),
+          _ => mat.spans.first().unwrap(),
+        };
+        let line = &self.state.lines[anchor.line];
+        let span_text = &line[anchor.start..anchor.end];
+        let offset = Self::display_column(line, anchor.start) as i32 - 1;
+        let hint_width = self.make_hint_text(hint).width_cjk() as i32;
         let extra_position = match self.position {
-          "right" => text.width_cjk() - hint.len(),
-          "off_left" => 0 - hint.len() - if self.contrast { 2 } else { 0 },
-          "off_right" => text.width_cjk(),
+          "right" => span_text.width_cjk() as i32 - hint_width,
+          "off_left" => -hint_width,
+          "off_right" => span_text.width_cjk() as i32,
           _ => 0,
         };
 
         let text = self.make_hint_text(hint.as_str());
-        let final_position = std::cmp::max(offset as i16 + extra_position as i16, 0);
+        let final_position = std::cmp::max(offset + extra_position, 0) as u16 + 1;
 
-        print!(
+        write!(
+          stdout,
           "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-          goto = cursor::Goto(final_position as u16 + 1, anchor.line as u16 + 1),
+          goto = cursor::Goto(final_position, anchor.line as u16 + 1),
           foregroud = color::Fg(&*self.hint_foreground_color),
           background = color::Bg(&*self.hint_background_color),
           resetf = color::Fg(color::Reset),
           resetb = color::Bg(color::Reset),
           text = &text
-        );
+        )
+        .unwrap();
 
         if hint.starts_with(typed_hint) {
-          print!(
+          write!(
+            stdout,
             "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-            goto = cursor::Goto(final_position as u16 + 1, anchor.line as u16 + 1),
+            goto = cursor::Goto(final_position, anchor.line as u16 + 1),
             foregroud = color::Fg(&*self.multi_foreground_color),
             background = color::Bg(&*self.multi_background_color),
             resetf = color::Fg(color::Reset),
             resetb = color::Bg(color::Reset),
             text = &typed_hint
-          );
+          )
+          .unwrap();
         }
       }
     }
@@ -312,9 +333,54 @@ impl<'a> View<'a> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use state::{Match, ScreenSpan};
 
   fn split(output: &str) -> Vec<&str> {
     output.split("\n").collect::<Vec<&str>>()
+  }
+
+  fn render_multiline_match(position: &str) -> String {
+    let lines = split("中文 https://host/very\n  long/path");
+    let custom = vec![];
+    let mut state = state::State::new(&lines, "abcd", &custom, None);
+    let view = View {
+      state: &mut state,
+      skip: 0,
+      multi: false,
+      contrast: false,
+      position,
+      matches: vec![Match {
+        pattern: "url",
+        text: "https://host/verylong/path".to_string(),
+        spans: vec![
+          ScreenSpan {
+            line: 0,
+            start: 7,
+            end: 24,
+          },
+          ScreenSpan {
+            line: 1,
+            start: 2,
+            end: 11,
+          },
+        ],
+        hint: Some("z".to_string()),
+      }],
+      select_foreground_color: colors::get_color("default"),
+      select_background_color: colors::get_color("default"),
+      multi_foreground_color: colors::get_color("default"),
+      multi_background_color: colors::get_color("default"),
+      foreground_color: colors::get_color("default"),
+      background_color: colors::get_color("default"),
+      hint_background_color: colors::get_color("default"),
+      hint_foreground_color: colors::get_color("default"),
+      chosen: vec![],
+    };
+    let mut output = Vec::new();
+
+    view.render(&mut output, "x");
+
+    String::from_utf8(output).unwrap()
   }
 
   #[test]
@@ -346,5 +412,28 @@ mod tests {
     view.contrast = true;
     let result = view.make_hint_text("a");
     assert_eq!(result, "[a]".to_string());
+  }
+
+  #[test]
+  fn renders_all_spans_with_one_hint() {
+    let output = render_multiline_match("left");
+
+    assert_eq!(output.matches("https://host/very").count(), 2);
+    assert_eq!(output.matches("long/path").count(), 2);
+    assert!(!output.contains("https://host/verylong/path"));
+    assert_eq!(output.matches('z').count(), 1);
+  }
+
+  #[test]
+  fn uses_cjk_display_columns_and_requested_hint_anchor() {
+    let left = render_multiline_match("left");
+    let right = render_multiline_match("right");
+    let first_span_cursor = cursor::Goto(6, 1).to_string();
+    let right_hint_cursor = cursor::Goto(11, 2).to_string();
+
+    assert_eq!(left.matches(&first_span_cursor).count(), 2);
+    assert!(!left.contains(&right_hint_cursor));
+    assert_eq!(right.matches(&first_span_cursor).count(), 1);
+    assert_eq!(right.matches(&right_hint_cursor).count(), 1);
   }
 }
