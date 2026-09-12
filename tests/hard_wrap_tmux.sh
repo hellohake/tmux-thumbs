@@ -245,6 +245,8 @@ run_case("gutter-columns", "◆ /tmp/file.rs\r\nFOLLOWING_ROW_MUST_STAY\r\n", "/
          marker="FOLLOWING_ROW_MUST_STAY", plain_prefix="◆ /tmp/")
 relative = "./.ai_doc/records/inbox/design.md"
 run_case("cjk-root", "◆ 详细方案已写入" + relative + "，推荐\r\n", relative, 80, plain_prefix="◆ 详细方案已写入./")
+filename = "skill-eval-review-report-20260912.md"
+run_case("bare-filename", "◆ 已写成本地 Markdown 文档：\r\n\r\n" + filename + "\r\n", filename, 80)
 
 prefix = "  │ && stat -c '%a %s %n' /workspace/.ai_doc/records/"
 suffix = "  │ inbox/2026-09-12-portable-core-plugin-design.md"
