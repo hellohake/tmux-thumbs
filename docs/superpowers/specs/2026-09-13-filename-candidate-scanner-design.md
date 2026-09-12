@@ -225,4 +225,3 @@ After verification:
 - Do not rely on filesystem existence.
 - Do not add cross-line joining for bare filenames in this change.
 - Do not modify the user's tmux or Neovim configuration for this change.
-

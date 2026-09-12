@@ -91,4 +91,3 @@ pub fn scan(line: &str) -> Vec<FilenameMatch>;
 - [ ] Commit any final integration-only adjustment with `test: cover bare filenames in tmux`.
 - [ ] Push `master`, fast-forward `~/.tmux/plugins/tmux-thumbs`, rebuild there, and rerun the isolated tmux script from the runtime checkout.
 - [ ] Verify the source checkout and TPM checkout are clean and on the same commit. No tmux restart or configuration reload is required.
-
