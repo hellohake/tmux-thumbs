@@ -6,6 +6,7 @@ extern crate termion;
 
 mod alphabets;
 mod colors;
+mod filename;
 mod state;
 mod url_path;
 mod view;
