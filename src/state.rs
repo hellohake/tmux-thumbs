@@ -191,6 +191,37 @@ impl<'a> State<'a> {
 
   pub fn matches(&self, reverse: bool, unique: bool) -> Vec<Match> {
     let mut matches = Self::collect_matches(self.lines, self.regexp);
+    let mut filenames = Vec::new();
+    for (line_index, line) in self.lines.iter().enumerate() {
+      for filename in super::filename::scan(line) {
+        let span = ScreenSpan {
+          line: line_index,
+          start: filename.start,
+          end: filename.end,
+        };
+        let overlaps_custom = matches
+          .iter()
+          .any(|candidate| candidate.pattern == "custom" && Self::spans_overlap(&candidate.spans, &[span.clone()]));
+        if !overlaps_custom {
+          filenames.push(Match {
+            pattern: "path",
+            text: line[filename.start..filename.end].to_string(),
+            spans: vec![span],
+            hint: None,
+          });
+        }
+      }
+    }
+    for filename in filenames {
+      matches.retain(|candidate| {
+        candidate.pattern == "custom"
+          || !candidate
+            .spans
+            .iter()
+            .all(|span| Self::span_contains(filename.anchor(), span))
+      });
+      matches.push(filename);
+    }
     let mut soft_wrapped = vec![false; self.lines.len()];
     if let Some(joined) = self.joined_text {
       let logical_lines: Vec<_> = joined.split('\n').collect();
@@ -275,6 +306,10 @@ impl<'a> State<'a> {
         .iter()
         .any(|b| a.line == b.line && a.start < b.end && b.start < a.end)
     })
+  }
+
+  fn span_contains(container: &ScreenSpan, inner: &ScreenSpan) -> bool {
+    container.line == inner.line && container.start <= inner.start && container.end >= inner.end
   }
 
   fn map_logical_lines(physical: &[&str], logical: &[&str]) -> Option<Vec<Vec<(usize, ScreenSpan)>>> {
@@ -414,6 +449,44 @@ mod tests {
         start: 7,
         end: 18,
       }]
+    );
+  }
+
+  #[test]
+  fn bare_filename_outranks_sha_inside_it() {
+    let lines = split("已写成本地 Markdown 文档： skill-eval-review-report-20260912.md");
+    let custom = vec![];
+    let results = State::new(&lines, "abcd", &custom, None).matches(false, false);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].pattern, "path");
+    assert_eq!(results[0].text, "skill-eval-review-report-20260912.md");
+    assert_eq!(results[0].hint.as_deref(), Some("a"));
+  }
+
+  #[test]
+  fn custom_match_keeps_priority_over_a_bare_filename() {
+    let lines = split("report-20260912.md");
+    let custom = vec!["report-[0-9]+\\.md"];
+    let results = State::new(&lines, "abcd", &custom, None).matches(false, false);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].pattern, "custom");
+    assert_eq!(results[0].text, "report-20260912.md");
+  }
+
+  #[test]
+  fn standalone_sha_and_number_behavior_is_unchanged() {
+    let lines = split("DOC_OK lines=268 bytes=14797 commit=20260912");
+    let custom = vec![];
+    let results = State::new(&lines, "abcd", &custom, None).matches(false, false);
+
+    assert_eq!(
+      results
+        .iter()
+        .map(|candidate| (candidate.pattern, candidate.text.as_str()))
+        .collect::<Vec<_>>(),
+      [("number", "14797"), ("sha", "20260912")]
     );
   }
 
