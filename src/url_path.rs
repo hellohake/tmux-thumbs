@@ -805,7 +805,10 @@ mod tests {
       ),
       ("/workspace/README\n  设计.md", vec!["/workspace/README"]),
       ("path/file.go\n  42:7", vec!["path/file.go"]),
-      ("  │ /workspace/docs/\n  └ result.txt", vec!["/workspace/docs/"]),
+      (
+        "  │ /workspace/docs/\n  └ result.txt",
+        vec!["/workspace/docs/", "result.txt"],
+      ),
       (
         "  │ /workspace/docs/\n    │ other/file.rs",
         vec!["/workspace/docs/", "other/file.rs"],

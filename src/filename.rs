@@ -68,11 +68,18 @@ fn classify_token(line: &str, raw_start: usize, raw_end: usize) -> Option<Filena
     return None;
   }
 
-  if KNOWN_BASENAMES.contains(&lower.as_str()) || known_extension(&lower) {
+  if KNOWN_BASENAMES.contains(&lower.as_str()) || known_extension(&lower) || has_explicit_file_context(line, start) {
     Some(FilenameMatch { start, end })
   } else {
     None
   }
+}
+
+fn has_explicit_file_context(line: &str, start: usize) -> bool {
+  let prefix = line[..start].trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '：'));
+  ["文件", "文档", "file", "written to"]
+    .iter()
+    .any(|marker| prefix.to_ascii_lowercase().ends_with(marker))
 }
 
 fn adjacent_to_slash(line: &str, start: usize, end: usize) -> bool {
@@ -191,5 +198,20 @@ mod tests {
     let line = "host.example.com 1.2.3 v1.2.3 127.0.0.1 report-20260912 artifact.xyzabc ordinary-word";
 
     assert!(matched(line).is_empty());
+  }
+
+  #[test]
+  fn accepts_unknown_extensions_only_with_explicit_file_context() {
+    let cases = [
+      ("文件 artifact.xyzabc", "artifact.xyzabc"),
+      ("文档：report.customext", "report.customext"),
+      ("file output.weirdext", "output.weirdext"),
+      ("written to result.privateext", "result.privateext"),
+    ];
+
+    for (line, expected) in cases {
+      assert_eq!(matched(line), [expected], "{:?}", line);
+    }
+    assert!(matched("artifact.xyzabc").is_empty());
   }
 }
