@@ -51,7 +51,7 @@ impl<'a> View<'a> {
     hint_background_color: Box<dyn color::Color>,
   ) -> View<'a> {
     let matches = state.matches(reverse, unique);
-    let skip = if reverse { matches.len() - 1 } else { 0 };
+    let skip = if reverse { matches.len().saturating_sub(1) } else { 0 };
 
     View {
       state,
@@ -93,7 +93,7 @@ impl<'a> View<'a> {
   }
 
   fn display_column(line: &str, byte_offset: usize) -> u16 {
-    line[..byte_offset].width_cjk() as u16 + 1
+    line[..byte_offset].width() as u16 + 1
   }
 
   fn render(&self, stdout: &mut dyn Write, typed_hint: &str) -> () {
@@ -158,16 +158,21 @@ impl<'a> View<'a> {
         let line = &self.state.lines[anchor.line];
         let span_text = &line[anchor.start..anchor.end];
         let offset = Self::display_column(line, anchor.start) as i32 - 1;
-        let hint_width = self.make_hint_text(hint).width_cjk() as i32;
+        let hint_width = self.make_hint_text(hint).width() as i32;
         let extra_position = match self.position {
-          "right" => span_text.width_cjk() as i32 - hint_width,
+          "right" => span_text.width() as i32 - hint_width,
           "off_left" => -hint_width,
-          "off_right" => span_text.width_cjk() as i32,
+          "off_right" => span_text.width() as i32,
           _ => 0,
         };
 
         let text = self.make_hint_text(hint.as_str());
-        let final_position = std::cmp::max(offset + extra_position, 0) as u16 + 1;
+        let right_edge = self
+          .state
+          .pane_width()
+          .map(|width| width as i32 - hint_width)
+          .unwrap_or(i32::MAX);
+        let final_position = (offset + extra_position).min(right_edge).max(0) as u16 + 1;
 
         write!(
           stdout,
@@ -412,6 +417,19 @@ mod tests {
     view.contrast = true;
     let result = view.make_hint_text("a");
     assert_eq!(result, "[a]".to_string());
+  }
+
+  #[test]
+  fn display_columns_keep_tui_gutters_single_width() {
+    for prefix in ["◆ ", "  │ ", "  └ ", "◆ 中文 "] {
+      let expected = match prefix {
+        "◆ " => 3,
+        "◆ 中文 " => 8,
+        _ => 5,
+      };
+      let line = format!("{}/tmp/file.rs", prefix);
+      assert_eq!(View::display_column(&line, prefix.len()), expected, "{:?}", prefix);
+    }
   }
 
   #[test]

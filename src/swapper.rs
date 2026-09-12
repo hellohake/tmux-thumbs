@@ -241,10 +241,9 @@ impl<'a> Swapper<'a> {
       .unwrap_or_default();
 
     let pane_command = format!(
-        "tmux capture-pane -J -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp}{pane_width_param} {args}; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
+        "umask 077; tmux capture-pane -N -b {signal}-screen -t {active_pane_id}{scroll_params} \\; capture-pane -J -b {signal}-joined -t {active_pane_id}{scroll_params} \\; save-buffer -b {signal}-screen {tmp}.screen \\; save-buffer -b {signal}-joined {tmp}.joined \\; delete-buffer -b {signal}-screen \\; delete-buffer -b {signal}-joined; {dir}/target/release/thumbs -f '%U:%H' -t {tmp}{pane_width_param} --joined-capture {tmp}.joined {args} < {tmp}.screen; rm -f {tmp}.screen {tmp}.joined; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
         active_pane_id = active_pane_id,
         scroll_params = scroll_params,
-        height = self.active_pane_height.unwrap_or(i32::MAX),
         dir = self.dir,
         tmp = self.tmp_file,
         pane_width_param = pane_width_param,

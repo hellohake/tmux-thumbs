@@ -1,12 +1,12 @@
 use super::state::{Match, ScreenSpan};
 use unicode_width::UnicodeWidthStr;
 
-pub fn normalize(lines: &[&str], mut matches: Vec<Match>, pane_width: Option<usize>) -> Vec<Match> {
-  for candidate in matches.iter_mut() {
-    if candidate.pattern == "url" || candidate.pattern == "path" {
-      trim_candidate(candidate);
-    }
-  }
+pub fn normalize(
+  lines: &[&str],
+  mut matches: Vec<Match>,
+  pane_width: Option<usize>,
+  soft_wrapped: &[bool],
+) -> Vec<Match> {
   matches.retain(|candidate| candidate.pattern != "path" || is_meaningful_path(&candidate.text));
 
   let width = match pane_width.filter(|width| *width > 0) {
@@ -26,7 +26,7 @@ pub fn normalize(lines: &[&str], mut matches: Vec<Match>, pane_width: Option<usi
       continue;
     }
 
-    if let Some(joined_candidate) = join_candidate(lines, candidate, width) {
+    if let Some(joined_candidate) = join_candidate(lines, candidate, width, soft_wrapped) {
       joined.push(joined_candidate);
     }
   }
@@ -49,45 +49,89 @@ pub fn normalize(lines: &[&str], mut matches: Vec<Match>, pane_width: Option<usi
   matches
 }
 
-fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize) -> Option<Match> {
+fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize, soft_wrapped: &[bool]) -> Option<Match> {
   let mut joined = candidate.clone();
-  let mut current_line = candidate.anchor().line;
+  let mut current_line = candidate.spans.last()?.line;
 
-  loop {
-    let current = *lines.get(current_line)?;
-    restore_join_separator(current, &mut joined);
-    let next_line = current_line + 1;
-    let next = match lines.get(next_line) {
-      Some(next) => *next,
+  while let Some(next) = lines.get(current_line + 1) {
+    if soft_wrapped.get(current_line).copied().unwrap_or(false) {
+      break;
+    }
+    let current = lines[current_line];
+    let mut pending = joined.clone();
+    restore_join_separator(current, &mut pending);
+    let start = match continuation_start(current, next) {
+      Some(start) => start,
       None => break,
     };
-    let span = match continuation_span(joined.pattern, next, &joined.text) {
+    let span = match continuation_span(pending.pattern, next, start, &pending.text) {
       Some(span) => ScreenSpan {
-        line: next_line,
+        line: current_line + 1,
         ..span
       },
       None => break,
     };
     let token = &next[span.start..span.end];
-    let current_span = joined.spans.last().unwrap();
-    if !reaches_wrap_boundary(current, current_span, token, pane_width) {
-      break;
-    }
-    if !is_confident_continuation(joined.pattern, &joined.text, token) {
+    if !reaches_wrap_boundary(current, pending.spans.last().unwrap(), token, pane_width)
+      || !is_confident_continuation(pending.pattern, &pending.text, token)
+    {
       break;
     }
 
-    joined.text.push_str(token);
-    joined.spans.push(span);
-    current_line = next_line;
+    let combined = format!("{}{}", pending.text, token);
+    let end = boundary_len(&combined, pending.pattern);
+    if end <= pending.text.len() {
+      break;
+    }
+    let mut span = span;
+    span.end = span.start + end - pending.text.len();
+    pending.text = combined[..end].to_string();
+    pending.spans.push(span);
+    joined = pending;
+    current_line += 1;
   }
 
   if joined.spans.len() == candidate.spans.len() {
     return None;
   }
+  let (start, end) = boundary_range(&joined.text, joined.pattern);
+  let mut leading = start;
+  let mut trailing = joined.text.len() - end;
+  for span in &mut joined.spans {
+    let removed = leading.min(span.end - span.start);
+    span.start += removed;
+    leading -= removed;
+  }
+  for span in joined.spans.iter_mut().rev() {
+    let removed = trailing.min(span.end - span.start);
+    span.end -= removed;
+    trailing -= removed;
+  }
+  joined.spans.retain(|span| span.start < span.end);
+  joined.text = joined.text[start..end].to_string();
+  (!joined.spans.is_empty()).then_some(joined)
+}
 
-  trim_candidate(&mut joined);
-  Some(joined)
+fn continuation_start(current: &str, next: &str) -> Option<usize> {
+  let trimmed = next.trim_start_matches([' ', '\t']);
+  let indent = next.len() - trimmed.len();
+  if indent == 0 || trimmed.is_empty() {
+    return None;
+  }
+  if let Some(rest) = trimmed.strip_prefix("│ ") {
+    let current_trimmed = current.trim_start_matches([' ', '\t']);
+    let current_indent = current.len() - current_trimmed.len();
+    let same_gutter = current_trimmed.starts_with("│ ") && current_indent == indent;
+    let tool_header = current_trimmed.starts_with("◆ Ran ") && indent == current_indent + 2;
+    if !same_gutter && !tool_header {
+      return None;
+    }
+    return Some(next.len() - rest.trim_start_matches([' ', '\t']).len());
+  }
+  if current.trim_start().starts_with("│ ") {
+    return None;
+  }
+  Some(indent)
 }
 
 fn restore_join_separator(line: &str, candidate: &mut Match) {
@@ -110,19 +154,18 @@ fn restore_join_separator(line: &str, candidate: &mut Match) {
 }
 
 fn reaches_wrap_boundary(line: &str, span: &ScreenSpan, continuation: &str, pane_width: usize) -> bool {
-  let visible_end = line.trim_end_matches(char::is_whitespace).len();
-  span.end == visible_end
-    && (line.width_cjk() >= pane_width
-      || (has_strong_path_structure(continuation) && line.width_cjk() + continuation.width_cjk() > pane_width))
+  let visible = line.trim_end_matches(char::is_whitespace);
+  span.end == visible.len()
+    && (visible.width() >= pane_width
+      || (has_strong_path_structure(continuation) && visible.width() + continuation.width() > pane_width))
 }
 
-fn continuation_span(pattern: &str, line: &str, accumulated: &str) -> Option<ScreenSpan> {
-  let trimmed = line.trim_start_matches(char::is_whitespace);
-  if trimmed.len() == line.len() || trimmed.is_empty() || is_blocked_continuation(pattern, trimmed, accumulated) {
+fn continuation_span(pattern: &str, line: &str, start: usize, accumulated: &str) -> Option<ScreenSpan> {
+  let trimmed = &line[start..];
+  if trimmed.is_empty() || is_blocked_continuation(pattern, trimmed, accumulated) {
     return None;
   }
 
-  let start = line.len() - trimmed.len();
   let end_in_trimmed = trimmed
     .char_indices()
     .take_while(|(_, ch)| is_candidate_char(pattern, *ch))
@@ -163,7 +206,11 @@ fn is_blocked_continuation(pattern: &str, text: &str, accumulated: &str) -> bool
   }
 
   if text.starts_with('/') {
-    return accumulated.ends_with('/') || path_looks_complete(accumulated);
+    let suffix = text.split_whitespace().next().unwrap_or(text);
+    return accumulated.ends_with('/')
+      || path_looks_complete(accumulated)
+      || !path_looks_complete(suffix)
+      || suffix[1..].contains('/');
   }
 
   text.starts_with("~/") || text.starts_with("./") || text.starts_with("../")
@@ -195,7 +242,7 @@ fn is_candidate_char(pattern: &str, ch: char) -> bool {
   if pattern == "url" {
     ch.is_ascii_graphic()
   } else {
-    ch.is_ascii_alphanumeric()
+    ch.is_alphanumeric()
       || matches!(
         ch,
         '.' | '_' | '-' | '@' | '$' | '~' | '%' | '+' | '*' | '[' | ']' | '(' | ')' | '/' | ':'
@@ -203,23 +250,28 @@ fn is_candidate_char(pattern: &str, ch: char) -> bool {
   }
 }
 
-fn is_confident_continuation(_pattern: &str, accumulated: &str, token: &str) -> bool {
-  accumulated
-    .chars()
-    .last()
-    .map(|ch| matches!(ch, '/' | ':' | '.' | '-' | '_' | '=' | '?' | '&' | '#' | '%'))
-    .unwrap_or(false)
-    || has_path_structure(token)
-}
-
-fn has_path_structure(text: &str) -> bool {
-  text
-    .chars()
-    .any(|ch| matches!(ch, '/' | ':' | '.' | '-' | '_' | '=' | '?' | '&' | '#' | '%'))
+fn is_confident_continuation(pattern: &str, accumulated: &str, token: &str) -> bool {
+  if is_numeric_location_suffix(token) {
+    return pattern == "path" && accumulated.ends_with(':');
+  }
+  if pattern == "path" {
+    if accumulated.ends_with(':') {
+      return false;
+    }
+    if !accumulated.ends_with(['/', ':', '.', '-', '_']) && !token.starts_with('/') {
+      return false;
+    }
+    if path_looks_complete(accumulated) && token.contains('/') {
+      return false;
+    }
+    return has_strong_path_structure(token) || (accumulated.ends_with(['.', '-', '_']) && !token.ends_with('.'));
+  }
+  has_strong_path_structure(token) || accumulated.ends_with(['/', '.', '-', '_', '=', '?', '&', '#', '%'])
 }
 
 fn has_strong_path_structure(text: &str) -> bool {
-  text.chars().any(|ch| matches!(ch, '/' | '.')) || is_numeric_location_suffix(text)
+  let bounded = text.trim_end_matches([')', ']', '}', ',', ';', ':']);
+  bounded.contains('/') || path_looks_complete(bounded) || is_numeric_location_suffix(bounded)
 }
 
 fn is_numeric_location_suffix(text: &str) -> bool {
@@ -247,27 +299,21 @@ fn overlaps(candidate: &Match, other: &Match) -> bool {
   })
 }
 
-fn trim_candidate(candidate: &mut Match) {
-  let (start, end) = boundary_range(&candidate.text, candidate.pattern);
-
-  if start > 0 || end < candidate.text.len() {
-    let removed_from_end = candidate.text.len() - end;
-    candidate.text = candidate.text[start..end].to_string();
-    let first_span = candidate
-      .spans
-      .first_mut()
-      .expect("URL/path candidate must have a screen span");
-    first_span.start += start;
-    let final_span = candidate
-      .spans
-      .last_mut()
-      .expect("URL/path candidate must have a screen span");
-    final_span.end -= removed_from_end;
-  }
-}
-
-fn boundary_range(text: &str, pattern: &str) -> (usize, usize) {
+pub fn boundary_range(text: &str, pattern: &str) -> (usize, usize) {
   let mut start = 0;
+  if matches!(pattern, "path" | "markdown_url") {
+    if let Some(slash) = text.find('/') {
+      let prefix = &text[..slash];
+      for root in ["..", ".", "~"] {
+        if let Some(prose) = prefix.strip_suffix(root) {
+          if prose.chars().any(|ch| !ch.is_ascii()) {
+            start = slash - root.len();
+            break;
+          }
+        }
+      }
+    }
+  }
   let mut end = trim_terminal_punctuation(text, pattern);
 
   loop {
@@ -315,6 +361,17 @@ fn boundary_len(text: &str, pattern: &str) -> usize {
           end = index;
           break;
         }
+      }
+      '\''
+        if text[..index].chars().last().map(char::is_alphanumeric).unwrap_or(false)
+          && text[index + 1..]
+            .chars()
+            .next()
+            .map(char::is_alphanumeric)
+            .unwrap_or(false) => {}
+      '\'' | '"' | '`' | '<' | '>' => {
+        end = index;
+        break;
       }
       _ => {}
     }
@@ -643,6 +700,141 @@ mod tests {
         input,
         results
       );
+    }
+  }
+
+  #[test]
+  fn explicit_roots_exclude_adjacent_prose_but_preserve_unicode_components() {
+    let cases = [
+      ("详细方案已写入./.ai_doc/design.md", "./.ai_doc/design.md"),
+      ("请看../文档/设计.md", "../文档/设计.md"),
+      ("已保存~/文档/设计.md", "~/文档/设计.md"),
+      ("见 ./文档/设计.md", "./文档/设计.md"),
+    ];
+    for (input, expected) in cases {
+      assert_path(input, expected, input.find(expected).unwrap());
+    }
+  }
+
+  #[test]
+  fn urls_share_boundaries_in_quotes_and_markdown() {
+    let cases = [
+      ("url=\"https://host/path\"", vec!["https://host/path"]),
+      ("'https://host/path'", vec!["https://host/path"]),
+      (
+        "https://host/search?q=don't-stop",
+        vec!["https://host/search?q=don't-stop"],
+      ),
+      ("\"https://host/author/O'Reilly\"", vec!["https://host/author/O'Reilly"]),
+      (
+        "[doc](https://host/wiki/Foo_(bar))",
+        vec!["https://host/wiki/Foo_(bar)"],
+      ),
+      (
+        "[a](https://host/a)[b](https://host/b)",
+        vec!["https://host/a", "https://host/b"],
+      ),
+      ("[文件](./文档/设计.md)", vec!["./文档/设计.md"]),
+    ];
+    for (input, expected) in cases {
+      let lines = vec![input];
+      let custom = vec![];
+      let result = State::new(&lines, "abcd", &custom, None).matches(false, false);
+      assert_eq!(
+        result.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        expected,
+        "{:?}",
+        input
+      );
+    }
+  }
+
+  #[test]
+  fn joins_aligned_tool_gutters_without_copying_decoration() {
+    let cases = [
+      (
+        "  │ /workspace/docs/\n  │ design.md",
+        19,
+        "path",
+        "/workspace/docs/design.md",
+      ),
+      (
+        "◆ Ran cat /workspace/docs/\n  │ design.md",
+        25,
+        "path",
+        "/workspace/docs/design.md",
+      ),
+      (
+        "  │ https://example.com/\n  │ docs/index.html",
+        23,
+        "url",
+        "https://example.com/docs/index.html",
+      ),
+      (
+        "  │ /workspace/long/\n  │ subdirectory/\n  │ file.rs",
+        19,
+        "path",
+        "/workspace/long/subdirectory/file.rs",
+      ),
+    ];
+    for (input, width, pattern, expected) in cases {
+      let candidate = matching_with_width(input, pattern, Some(width));
+      assert_eq!(candidate.text, expected, "{:?}", input);
+      for span in candidate.spans.iter().skip(1) {
+        assert_eq!(span.start, "  │ ".len());
+      }
+    }
+  }
+
+  #[test]
+  fn does_not_join_independent_targets_prose_or_output() {
+    let cases = [
+      ("path/to/\n  Done.", vec!["path/to/"]),
+      (
+        "src/first.rs\n  tests/second.rs",
+        vec!["src/first.rs", "tests/second.rs"],
+      ),
+      (
+        "  - /workspace/project\n    /another/project",
+        vec!["/workspace/project", "/another/project"],
+      ),
+      ("/workspace/build/\n  1234 5678", vec!["/workspace/build/"]),
+      (
+        "/workspace/README\n  docs/guide.md",
+        vec!["/workspace/README", "docs/guide.md"],
+      ),
+      ("/workspace/README\n  设计.md", vec!["/workspace/README"]),
+      ("path/file.go\n  42:7", vec!["path/file.go"]),
+      ("  │ /workspace/docs/\n  └ result.txt", vec!["/workspace/docs/"]),
+      (
+        "  │ /workspace/docs/\n    │ other/file.rs",
+        vec!["/workspace/docs/", "other/file.rs"],
+      ),
+      (
+        "  │ /workspace/docs/\n  │ && cat other/file.rs",
+        vec!["/workspace/docs/", "other/file.rs"],
+      ),
+    ];
+    for (input, expected) in cases {
+      let lines = input.split('\n').collect::<Vec<_>>();
+      let custom = vec![];
+      let result = State::new(&lines, "abcd", &custom, Some(pane_width(input))).matches(false, false);
+      let paths = result.iter().filter(|m| m.pattern == "path").collect::<Vec<_>>();
+      assert_eq!(
+        paths.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        expected,
+        "{:?}",
+        input
+      );
+      assert!(paths.iter().all(|m| m.spans.len() == 1), "{:?}", input);
+    }
+  }
+
+  #[test]
+  fn joins_unicode_path_components_at_hard_wraps() {
+    for input in ["../文档/\n  设计.md", "  │ ../文档/\n  │ 设计.md"] {
+      let candidate = matching_with_width(input, "path", Some(pane_width(input)));
+      assert_eq!(candidate.text, "../文档/设计.md");
     }
   }
 

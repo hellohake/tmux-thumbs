@@ -138,6 +138,12 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .takes_value(true),
     )
     .arg(
+      Arg::with_name("joined_capture")
+        .help("Joined capture of the same screen, for mapping terminal soft wraps")
+        .long("joined-capture")
+        .takes_value(true),
+    )
+    .arg(
       Arg::with_name("pane_width")
         .help("Sets the source tmux pane width for hard-wrap detection")
         .long("pane-width")
@@ -186,7 +192,13 @@ fn main() {
 
   let lines = output.split('\n').collect::<Vec<&str>>();
 
+  let joined_capture = args
+    .value_of("joined_capture")
+    .map(|path| std::fs::read_to_string(path).expect("Unable to read the joined screen capture"));
   let mut state = state::State::new(&lines, alphabet, &regexp, pane_width);
+  if let Some(ref joined) = joined_capture {
+    state = state.with_joined_text(joined);
+  }
 
   let selected = {
     let mut viewbox = view::View::new(

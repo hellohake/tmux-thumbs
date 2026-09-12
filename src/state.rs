@@ -4,7 +4,7 @@ use std::collections::HashMap;
 const EXCLUDE_PATTERNS: [(&'static str, &'static str); 1] = [("bash", r"[[:cntrl:]]\[([0-9]{1,2};)?([0-9]{1,2})?m")];
 
 const PATTERNS: [(&'static str, &'static str); 15] = [
-  ("markdown_url", r"\[[^]]*\]\(([^)]+)\)"),
+  ("markdown_url", r"\[[^]\n]*\]\((?P<match>[^\s]+)"),
   (
     "url",
     r"(?P<match>(https?://|git@|git://|ssh://|ftp://|file:///)[\x21-\x7e]+)",
@@ -62,6 +62,7 @@ pub struct State<'a> {
   alphabet: &'a str,
   regexp: &'a Vec<&'a str>,
   pane_width: Option<usize>,
+  joined_text: Option<&'a str>,
 }
 
 impl<'a> State<'a> {
@@ -76,10 +77,20 @@ impl<'a> State<'a> {
       alphabet,
       regexp,
       pane_width,
+      joined_text: None,
     }
   }
 
-  pub fn matches(&self, reverse: bool, unique: bool) -> Vec<Match> {
+  pub fn with_joined_text(mut self, text: &'a str) -> Self {
+    self.joined_text = Some(text);
+    self
+  }
+
+  pub fn pane_width(&self) -> Option<usize> {
+    self.pane_width
+  }
+
+  fn collect_matches(lines: &[&str], regexp: &[&str]) -> Vec<Match> {
     let mut matches = Vec::new();
 
     let exclude_patterns = EXCLUDE_PATTERNS
@@ -87,8 +98,7 @@ impl<'a> State<'a> {
       .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap()))
       .collect::<Vec<_>>();
 
-    let custom_patterns = self
-      .regexp
+    let custom_patterns = regexp
       .iter()
       .map(|regexp| ("custom", Regex::new(regexp).expect("Invalid custom regexp")))
       .collect::<Vec<_>>();
@@ -101,7 +111,7 @@ impl<'a> State<'a> {
     // This order determines the priority of pattern matching
     let all_patterns = [exclude_patterns, custom_patterns, patterns].concat();
 
-    for (index, line) in self.lines.iter().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
       let mut chunk: &str = line;
       let mut offset: usize = 0;
 
@@ -109,7 +119,7 @@ impl<'a> State<'a> {
         // For this line we search which patterns match, all of them.
         let submatches = all_patterns
           .iter()
-          .filter_map(|tuple| match tuple.1.find_iter(chunk).nth(0) {
+          .filter_map(|tuple| match tuple.1.find_iter(chunk).find(|m| m.start() < m.end()) {
             Some(m) => Some((tuple.0, tuple.1.clone(), m)),
             None => None,
           })
@@ -122,6 +132,7 @@ impl<'a> State<'a> {
           let (name, pattern, matching) = first_match;
           let text = matching.as_str();
 
+          let mut consumed = matching.end();
           if let Some(captures) = pattern.captures(text) {
             let captures: Vec<(&str, usize)> = if let Some(capture) = captures.name("match") {
               [(capture.as_str(), capture.start())].to_vec()
@@ -139,21 +150,33 @@ impl<'a> State<'a> {
             // Never hint or broke bash color sequences, but process it
             if *name != "bash" {
               for (subtext, substart) in captures.iter() {
+                let (start, end) = if matches!(*name, "url" | "path" | "markdown_url") {
+                  super::url_path::boundary_range(subtext, name)
+                } else {
+                  (0, subtext.len())
+                };
+                if matches!(*name, "url" | "path" | "markdown_url") {
+                  consumed = matching.start() + *substart + end;
+                }
+                if start == end {
+                  continue;
+                }
                 matches.push(Match {
                   pattern: name,
-                  text: subtext.to_string(),
+                  text: subtext[start..end].to_string(),
                   spans: vec![ScreenSpan {
                     line: index,
-                    start: offset + matching.start() + *substart,
-                    end: offset + matching.start() + *substart + subtext.len(),
+                    start: offset + matching.start() + *substart + start,
+                    end: offset + matching.start() + *substart + end,
                   }],
                   hint: None,
                 });
               }
             }
 
-            chunk = chunk.get(matching.end()..).expect("Unknown chunk");
-            offset += matching.end();
+            consumed = consumed.max(matching.start() + text.chars().next().unwrap().len_utf8());
+            chunk = chunk.get(consumed..).expect("Unknown chunk");
+            offset += consumed;
           } else {
             panic!("No matching?");
           }
@@ -163,7 +186,51 @@ impl<'a> State<'a> {
       }
     }
 
-    let mut matches = super::url_path::normalize(self.lines, matches, self.pane_width);
+    matches
+  }
+
+  pub fn matches(&self, reverse: bool, unique: bool) -> Vec<Match> {
+    let mut matches = Self::collect_matches(self.lines, self.regexp);
+    let mut soft_wrapped = vec![false; self.lines.len()];
+    if let Some(joined) = self.joined_text {
+      let logical_lines: Vec<_> = joined.split('\n').collect();
+      if let Some(mapping) = Self::map_logical_lines(self.lines, &logical_lines) {
+        for spans in &mapping {
+          for (_, span) in spans.iter().take(spans.len().saturating_sub(1)) {
+            soft_wrapped[span.line] = true;
+          }
+        }
+        for candidate in Self::collect_matches(&logical_lines, &[]) {
+          if !matches!(candidate.pattern, "path" | "url" | "markdown_url") {
+            continue;
+          }
+          let anchor = candidate.anchor();
+          let spans: Vec<_> = mapping[anchor.line]
+            .iter()
+            .filter_map(|(base, span)| {
+              let start = anchor.start.max(*base);
+              let end = anchor.end.min(*base + span.end - span.start);
+              (start < end).then(|| ScreenSpan {
+                line: span.line,
+                start: span.start + start - base,
+                end: span.start + end - base,
+              })
+            })
+            .collect();
+          if spans.len() < 2
+            || matches
+              .iter()
+              .any(|m| m.pattern == "custom" && Self::spans_overlap(&m.spans, &spans))
+          {
+            continue;
+          }
+          matches.retain(|m| !Self::spans_overlap(&m.spans, &spans));
+          matches.push(Match { spans, ..candidate });
+        }
+      }
+    }
+    matches.sort_by_key(|m| (m.anchor().line, m.anchor().start));
+    let mut matches = super::url_path::normalize(self.lines, matches, self.pane_width, &soft_wrapped);
 
     let alphabet = super::alphabets::get_alphabet(self.alphabet);
     let mut hints = alphabet.hints(matches.len());
@@ -201,6 +268,53 @@ impl<'a> State<'a> {
 
     matches
   }
+
+  fn spans_overlap(left: &[ScreenSpan], right: &[ScreenSpan]) -> bool {
+    left.iter().any(|a| {
+      right
+        .iter()
+        .any(|b| a.line == b.line && a.start < b.end && b.start < a.end)
+    })
+  }
+
+  fn map_logical_lines(physical: &[&str], logical: &[&str]) -> Option<Vec<Vec<(usize, ScreenSpan)>>> {
+    let mut row = 0;
+    let mut result = Vec::new();
+    for line in logical {
+      let mut offset = 0;
+      let mut spans = Vec::new();
+      loop {
+        let visible = physical.get(row)?.trim_end_matches(' ');
+        if !line.get(offset..)?.starts_with(visible) {
+          return None;
+        }
+        spans.push((
+          offset,
+          ScreenSpan {
+            line: row,
+            start: 0,
+            end: visible.len(),
+          },
+        ));
+        offset += visible.len();
+        row += 1;
+        if line.get(offset..)?.trim_matches(' ').is_empty() {
+          break;
+        }
+        let next = physical.get(row)?.trim_end_matches(' ');
+        let available = physical[row - 1].len() - visible.len();
+        let whitespace = line[offset..].len() - line[offset..].trim_start_matches(' ').len();
+        let spaces = (0..=available.min(whitespace)).find(|count| line[offset + count..].starts_with(next))?;
+        spans.last_mut()?.1.end += spaces;
+        offset += spaces;
+      }
+      result.push(spans);
+    }
+    if physical.get(row..)?.iter().any(|line| !line.trim().is_empty()) {
+      return None;
+    }
+    Some(result)
+  }
 }
 
 #[cfg(test)]
@@ -209,6 +323,80 @@ mod tests {
 
   fn split(output: &str) -> Vec<&str> {
     output.split("\n").collect::<Vec<&str>>()
+  }
+
+  #[test]
+  fn soft_wrap_mapping_preserves_wide_glyph_padding_and_row_coordinates() {
+    let lines = vec!["/tmp/abcdefghij ", "中文设计.md", "FOLLOWING_ROW"];
+    let custom = vec![];
+    let result = State::new(&lines, "abcd", &custom, Some(16))
+      .with_joined_text("/tmp/abcdefghij中文设计.md\nFOLLOWING_ROW")
+      .matches(false, false);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].text, "/tmp/abcdefghij中文设计.md");
+    assert_eq!(
+      result[0].spans,
+      vec![
+        ScreenSpan {
+          line: 0,
+          start: 0,
+          end: 15
+        },
+        ScreenSpan {
+          line: 1,
+          start: 0,
+          end: "中文设计.md".len()
+        },
+      ]
+    );
+  }
+
+  #[test]
+  fn soft_wrap_mapping_does_not_join_across_real_whitespace() {
+    let lines = vec!["/tmp/first.rs ", "/tmp/second.rs", "FOLLOWING_ROW"];
+    let custom = vec![];
+    let result = State::new(&lines, "abcd", &custom, Some(14))
+      .with_joined_text("/tmp/first.rs /tmp/second.rs\nFOLLOWING_ROW")
+      .matches(false, false);
+    assert_eq!(
+      result.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+      ["/tmp/first.rs", "/tmp/second.rs"]
+    );
+    assert!(result.iter().all(|m| m.spans.len() == 1));
+  }
+
+  #[test]
+  fn soft_wrap_whitespace_is_not_reinterpreted_as_a_hard_wrap() {
+    let lines = vec!["/tmp/     ", "  a/b.md"];
+    let custom = vec![];
+    let result = State::new(&lines, "abcd", &custom, Some(10))
+      .with_joined_text("/tmp/       a/b.md")
+      .matches(false, false);
+    assert_eq!(
+      result.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+      ["/tmp/", "a/b.md"]
+    );
+    assert!(result.iter().all(|m| m.spans.len() == 1));
+  }
+
+  #[test]
+  fn inconsistent_joined_capture_keeps_physical_candidates() {
+    let lines = vec!["/tmp/source.rs", "metadata"];
+    let custom = vec![];
+    let result = State::new(&lines, "abcd", &custom, Some(80))
+      .with_joined_text("unrelated content")
+      .matches(false, false);
+    assert_eq!(result[0].text, "/tmp/source.rs");
+    assert_eq!(result[0].spans.len(), 1);
+  }
+
+  #[test]
+  fn zero_length_custom_matches_do_not_panic_or_hide_paths() {
+    let lines = vec!["/tmp/file.rs"];
+    let custom = vec!["", "^", "z*"];
+    let result = State::new(&lines, "abcd", &custom, None).matches(false, false);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].text, "/tmp/file.rs");
   }
 
   #[test]

@@ -165,4 +165,93 @@ run_path_case \
   '' \
   'specs/**/*.md'
 
+python3 - "${ROOT_DIR}" "${SOCKET_NAME}" <<'PY'
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+root, socket = sys.argv[1:]
+env = {**os.environ, "TMUX": ""}
+
+def tmux(*args):
+    return subprocess.run(["tmux", "-L", socket, *args], env=env, check=True, capture_output=True, text=True).stdout
+
+def wait_for(check):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        result = check()
+        if result:
+            return result
+        time.sleep(0.02)
+    raise AssertionError("timed out waiting for isolated terminal")
+
+def run_case(name, text, expected, width, raw=False, marker=None, plain_prefix=None):
+    ready = name + "-ready"
+    code = (
+        "import sys,subprocess,time; sys.stdout.write(" + repr(text) + "); sys.stdout.flush(); "
+        "subprocess.run(['tmux','wait-for','-S'," + repr(ready) + "],check=True); time.sleep(30)"
+    )
+    tmux("new-session", "-d", "-s", name, "-x", str(width), "-y", "10", shlex.join([sys.executable, "-c", code]))
+    tmux("wait-for", ready)
+    source = tmux("display-message", "-p", "-t", name + ":", "#{pane_id}").strip()
+    window = tmux("display-message", "-p", "-t", source, "#{window_id}").strip()
+    before = tmux("capture-pane", "-p", "-t", source).splitlines()
+    tmux("set-option", "-g", "@thumbs-position", "right")
+    tmux("set-option", "-g", "@thumbs-unique", "1")
+    tmux("set-option", "-g", "set-clipboard", "off")
+    with tempfile.TemporaryDirectory(prefix="thumbs-picked-") as tmp:
+        result = Path(tmp) / "selected.txt"
+        command = 'printf %s "${THUMB}" > ' + shlex.quote(str(result))
+        launcher = shlex.join([root + "/target/release/tmux-thumbs", "--dir", root, "--command", command])
+        tmux("run-shell", "-b", "-t", source, launcher)
+        def ready_overlay():
+            pane = tmux("list-panes", "-t", window, "-F", "#{pane_id}").strip()
+            if pane == source:
+                return None
+            screen = tmux("capture-pane", "-p", "-t", pane)
+            return (pane, screen) if "[a]" in screen else None
+        pane, overlay = wait_for(ready_overlay)
+        after = overlay.splitlines()
+        assert overlay.count("[a]") == 1, (name, overlay)
+        if marker:
+            row = next(i for i, line in enumerate(before) if marker in line)
+            assert after[row] == before[row], (name, "unrelated row changed", before, after)
+        if plain_prefix:
+            assert any(line.startswith(plain_prefix) for line in after), (name, "gutter shifted", overlay)
+        if raw:
+            styled = tmux("capture-pane", "-p", "-e", "-t", pane)
+            assert "\x1b" in styled
+            for prefix in ["◆ ", "  │ ", "  └ "]:
+                for old, new in zip(before, after):
+                    if old.startswith(prefix):
+                        assert new.startswith(prefix), (name, old, new)
+        tmux("send-keys", "-t", pane, "-l", "a")
+        wait_for(lambda: result.exists())
+        assert result.read_text() == expected, (name, expected, result.read_text())
+        wait_for(lambda: tmux("list-panes", "-t", window, "-F", "#{pane_id}").strip() == source)
+    tmux("kill-session", "-t", name)
+    print(name + ": ok")
+
+path = "/workspace/" + "abcdefghij" * 5 + "/file.rs"
+for width in [40, 60, 80]:
+    run_case("soft-wrap-" + str(width), path + "\r\nFOLLOWING_ROW_MUST_STAY\r\n", path, width, marker="FOLLOWING_ROW_MUST_STAY")
+
+run_case("gutter-columns", "◆ /tmp/file.rs\r\nFOLLOWING_ROW_MUST_STAY\r\n", "/tmp/file.rs", 60,
+         marker="FOLLOWING_ROW_MUST_STAY", plain_prefix="◆ /tmp/")
+relative = "./.ai_doc/records/inbox/design.md"
+run_case("cjk-root", "◆ 详细方案已写入" + relative + "，推荐\r\n", relative, 80, plain_prefix="◆ 详细方案已写入./")
+
+prefix = "  │ && stat -c '%a %s %n' /workspace/.ai_doc/records/"
+suffix = "  │ inbox/2026-09-12-portable-core-plugin-design.md"
+text = "\x1b[?7l\x1b[2J\x1b[H" + prefix + "\x1b[2;1H" + suffix + "\x1b[3;1H  └ finished\x1b[?7h"
+for width in [80, 90]:
+    run_case("tool-gutter-" + str(width), text, "/workspace/.ai_doc/records/inbox/2026-09-12-portable-core-plugin-design.md", width,
+             marker="finished", plain_prefix="  │ && stat -c", raw=True)
+PY
+
 printf 'hard-wrap tmux test: ok\n'
