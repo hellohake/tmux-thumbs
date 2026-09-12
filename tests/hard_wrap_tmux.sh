@@ -155,6 +155,11 @@ run_path_case \
   '        compatibility/design.md：命令实际解析版本为权威' \
   "${BASE}life-service-card-admin-compatibility/design.md"
 run_path_case \
+  'metadata-boundary' \
+  ' Directory:            /data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits' \
+  ' Permissions:          Full Access' \
+  '/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits'
+run_path_case \
   'glob' \
   'specs/**/*.md 与 grill-spec.md 已复核' \
   '' \

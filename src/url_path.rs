@@ -147,6 +147,9 @@ fn is_blocked_continuation(pattern: &str, text: &str, accumulated: &str) -> bool
   if blocked_prefixes.iter().any(|prefix| text.starts_with(prefix)) {
     return true;
   }
+  if starts_metadata_field(text) {
+    return true;
+  }
 
   if ["http://", "https://", "git://", "ssh://", "ftp://", "file:///", "git@"]
     .iter()
@@ -164,6 +167,20 @@ fn is_blocked_continuation(pattern: &str, text: &str, accumulated: &str) -> bool
   }
 
   text.starts_with("~/") || text.starts_with("./") || text.starts_with("../")
+}
+
+fn starts_metadata_field(text: &str) -> bool {
+  let (label, value) = match text.split_once(':') {
+    Some(parts) => parts,
+    None => return false,
+  };
+
+  !label.is_empty()
+    && label.chars().any(|ch| ch.is_ascii_alphabetic())
+    && label
+      .chars()
+      .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '_' | '-'))
+    && (value.is_empty() || value.starts_with(char::is_whitespace))
 }
 
 fn path_looks_complete(path: &str) -> bool {
@@ -202,7 +219,20 @@ fn has_path_structure(text: &str) -> bool {
 }
 
 fn has_strong_path_structure(text: &str) -> bool {
-  text.chars().any(|ch| matches!(ch, '/' | '.' | ':'))
+  text.chars().any(|ch| matches!(ch, '/' | '.')) || is_numeric_location_suffix(text)
+}
+
+fn is_numeric_location_suffix(text: &str) -> bool {
+  let mut parts = text.split(':');
+  let line = parts.next().unwrap_or_default();
+  let column = parts.next();
+
+  !line.is_empty()
+    && line.chars().all(|ch| ch.is_ascii_digit())
+    && column
+      .map(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+      .unwrap_or(true)
+    && parts.next().is_none()
 }
 
 fn is_meaningful_path(text: &str) -> bool {
@@ -470,6 +500,15 @@ mod tests {
   }
 
   #[test]
+  fn joins_a_numeric_location_suffix_wrapped_before_the_pane_edge() {
+    let input = "path/file.go:\n  42:7";
+    let candidate = matching_with_width(input, "path", Some(16));
+
+    assert_eq!(candidate.text, "path/file.go:42:7");
+    assert_eq!(candidate.spans.len(), 2);
+  }
+
+  #[test]
   fn joins_url_across_three_lines() {
     let input = "https://example.com/a/\n  long-path-segment/bb/\n  final.html";
     let candidate = matching_with_width(input, "url", Some(pane_width(input)));
@@ -542,6 +581,42 @@ mod tests {
     let results = State::new(&lines, "abcd", &custom, Some(pane_width(input))).matches(false, false);
 
     assert!(results.iter().all(|candidate| candidate.spans.len() == 1));
+  }
+
+  #[test]
+  fn does_not_join_a_complete_path_with_a_following_metadata_field() {
+    let input = " Directory:            /data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits\n Permissions:          Full Access";
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let custom = vec![];
+    let results = State::new(&lines, "abcd", &custom, Some(136)).matches(false, false);
+    let path = results
+      .iter()
+      .find(|candidate| candidate.pattern == "path" && candidate.text.starts_with("/data00/"))
+      .expect("directory path candidate");
+
+    assert_eq!(
+      path.text,
+      "/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits"
+    );
+    assert_eq!(path.spans.len(), 1);
+  }
+
+  #[test]
+  fn does_not_join_a_metadata_field_that_contains_path_punctuation() {
+    let input = " Directory:            /data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits\n Agents.md:            AGENTS.md";
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let custom = vec![];
+    let results = State::new(&lines, "abcd", &custom, Some(130)).matches(false, false);
+    let path = results
+      .iter()
+      .find(|candidate| candidate.pattern == "path" && candidate.text.starts_with("/data00/"))
+      .expect("directory path candidate");
+
+    assert_eq!(
+      path.text,
+      "/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits"
+    );
+    assert_eq!(path.spans.len(), 1);
   }
 
   #[test]
