@@ -3,7 +3,10 @@ extern crate clap;
 use self::clap::{App, Arg};
 use clap::crate_version;
 use regex::Regex;
+use std::fs::{self, OpenOptions, Permissions};
 use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,15 +14,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 trait Executor {
   fn execute(&mut self, args: Vec<String>) -> String;
   fn last_executed(&self) -> Option<Vec<String>>;
+  fn last_succeeded(&self) -> bool;
 }
 
 struct RealShell {
   executed: Option<Vec<String>>,
+  succeeded: bool,
 }
 
 impl RealShell {
   fn new() -> RealShell {
-    RealShell { executed: None }
+    RealShell {
+      executed: None,
+      succeeded: true,
+    }
   }
 }
 
@@ -31,6 +39,7 @@ impl Executor for RealShell {
       .expect("Couldn't run it");
 
     self.executed = Some(args);
+    self.succeeded = execution.status.success();
 
     let output: String = String::from_utf8_lossy(&execution.stdout).into();
 
@@ -40,9 +49,47 @@ impl Executor for RealShell {
   fn last_executed(&self) -> Option<Vec<String>> {
     self.executed.clone()
   }
+
+  fn last_succeeded(&self) -> bool {
+    self.succeeded
+  }
 }
 
 static INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
+
+fn shell_quote(value: &str) -> String {
+  format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PaneState {
+  pane_id: String,
+  in_mode: bool,
+  height: i32,
+  width: usize,
+  scroll_position: Option<i32>,
+  history_size: usize,
+  zoomed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotError {
+  RuntimeSetupFailed,
+  CaptureFailed,
+  PaneChanged,
+}
+
+impl PaneState {
+  fn is_stable_after(&self, other: &PaneState) -> bool {
+    self.pane_id == other.pane_id
+      && self.in_mode == other.in_mode
+      && self.height == other.height
+      && self.width == other.width
+      && self.zoomed == other.zoomed
+      && (!self.in_mode || (self.scroll_position == other.scroll_position && self.history_size == other.history_size))
+  }
+}
 
 #[allow(dead_code)]
 fn dbg(msg: &str) {
@@ -64,13 +111,12 @@ pub struct Swapper<'a> {
   multi_command: String,
   osc52: bool,
   active_pane_id: Option<String>,
-  active_pane_height: Option<i32>,
   active_pane_width: Option<usize>,
-  active_pane_scroll_position: Option<i32>,
   active_pane_zoomed: Option<bool>,
   thumbs_pane_id: Option<String>,
   content: Option<String>,
   signal: String,
+  runtime_dir: PathBuf,
   tmp_file: String,
 }
 
@@ -93,7 +139,10 @@ impl<'a> Swapper<'a> {
       INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
     let signal = format!("thumbs-finished-{}", instance);
-    let tmp_file = format!("/tmp/thumbs-last-{}", instance);
+    let temp_root = std::env::temp_dir();
+    let temp_root = fs::canonicalize(&temp_root).unwrap_or(temp_root);
+    let runtime_dir = temp_root.join(format!("tmux-thumbs-{}", instance));
+    let tmp_file = runtime_dir.join("selection").to_string_lossy().into_owned();
 
     Swapper {
       executor,
@@ -103,23 +152,22 @@ impl<'a> Swapper<'a> {
       multi_command,
       osc52,
       active_pane_id: None,
-      active_pane_height: None,
       active_pane_width: None,
-      active_pane_scroll_position: None,
       active_pane_zoomed: None,
       thumbs_pane_id: None,
       content: None,
       signal,
+      runtime_dir,
       tmp_file,
     }
   }
 
-  pub fn capture_active_pane(&mut self) {
+  fn read_active_pane_state(&mut self) -> PaneState {
     let active_command = vec![
       "tmux",
       "list-panes",
       "-F",
-      "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{pane_width}:#{scroll_position}:#{window_zoomed_flag}:#{?pane_active,active,nope}",
+      "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{pane_width}:#{scroll_position}:#{history_size}:#{window_zoomed_flag}:#{?pane_active,active,nope}",
     ];
 
     let output = self
@@ -131,45 +179,164 @@ impl<'a> Swapper<'a> {
 
     let active_pane = chunks
       .iter()
-      .find(|&chunks| *chunks.get(6).unwrap() == "active")
+      .find(|&chunks| *chunks.get(7).unwrap() == "active")
       .expect("Unable to find active pane");
 
-    let pane_id = active_pane.get(0).unwrap();
+    let in_mode = *active_pane.get(1).expect("Unable to retrieve pane mode") == "1";
+    let scroll_position = active_pane
+      .get(4)
+      .filter(|value| in_mode && !value.is_empty())
+      .map(|value| value.parse().expect("Unable to retrieve pane scroll"));
 
-    self.active_pane_id = Some(pane_id.to_string());
-
-    let pane_height = active_pane
-      .get(2)
-      .unwrap()
-      .parse()
-      .expect("Unable to retrieve pane height");
-
-    self.active_pane_height = Some(pane_height);
-
-    let pane_width = active_pane
-      .get(3)
-      .unwrap()
-      .parse()
-      .expect("Unable to retrieve pane width");
-
-    self.active_pane_width = Some(pane_width);
-
-    if active_pane.get(1).unwrap().to_string() == "1" {
-      let pane_scroll_position = active_pane
-        .get(4)
-        .unwrap()
+    PaneState {
+      pane_id: active_pane.get(0).expect("Unable to retrieve pane id").to_string(),
+      in_mode,
+      height: active_pane
+        .get(2)
+        .expect("Unable to retrieve pane height")
         .parse()
-        .expect("Unable to retrieve pane scroll");
-
-      self.active_pane_scroll_position = Some(pane_scroll_position);
+        .expect("Unable to retrieve pane height"),
+      width: active_pane
+        .get(3)
+        .expect("Unable to retrieve pane width")
+        .parse()
+        .expect("Unable to retrieve pane width"),
+      scroll_position,
+      history_size: active_pane
+        .get(5)
+        .expect("Unable to retrieve pane history size")
+        .parse()
+        .expect("Unable to retrieve pane history size"),
+      zoomed: *active_pane.get(6).expect("Unable to retrieve zoom pane property") == "1",
     }
-
-    let zoomed_pane = *active_pane.get(5).expect("Unable to retrieve zoom pane property") == "1";
-
-    self.active_pane_zoomed = Some(zoomed_pane);
   }
 
-  pub fn execute_thumbs(&mut self) {
+  fn use_pane_state(&mut self, state: &PaneState) {
+    self.active_pane_id = Some(state.pane_id.clone());
+    self.active_pane_width = Some(state.width);
+    self.active_pane_zoomed = Some(state.zoomed);
+  }
+
+  pub fn capture_active_pane(&mut self) {
+    let state = self.read_active_pane_state();
+    self.use_pane_state(&state);
+  }
+
+  fn snapshot_path(&self, name: &str) -> PathBuf {
+    self.runtime_dir.join(name)
+  }
+
+  fn prepare_snapshot_file(path: &Path) -> std::io::Result<()> {
+    let file = OpenOptions::new().create_new(true).write(true).mode(0o600).open(path)?;
+    file.set_permissions(Permissions::from_mode(0o600))
+  }
+
+  fn prepare_runtime_dir(&self) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(&self.runtime_dir)?;
+    let result = Self::prepare_snapshot_file(&self.snapshot_path("screen"))
+      .and_then(|_| Self::prepare_snapshot_file(&self.snapshot_path("joined")));
+    if result.is_err() {
+      self.cleanup_runtime_dir();
+    }
+    result
+  }
+
+  pub fn cleanup_runtime_dir(&self) {
+    let _ = fs::remove_dir_all(&self.runtime_dir);
+  }
+
+  fn capture_snapshot_files(&mut self, state: &PaneState) -> bool {
+    let screen_path = self.snapshot_path("screen");
+    let joined_path = self.snapshot_path("joined");
+    let screen_path = screen_path.to_string_lossy().into_owned();
+    let joined_path = joined_path.to_string_lossy().into_owned();
+
+    let screen_buffer = format!("{}-screen", self.signal);
+    let joined_buffer = format!("{}-joined", self.signal);
+    let mut command = vec![
+      "tmux".to_string(),
+      "capture-pane".to_string(),
+      "-N".to_string(),
+      "-b".to_string(),
+      screen_buffer.clone(),
+      "-t".to_string(),
+      state.pane_id.clone(),
+    ];
+    if let Some(scroll_position) = state.scroll_position {
+      command.extend([
+        "-S".to_string(),
+        (-scroll_position).to_string(),
+        "-E".to_string(),
+        (state.height - scroll_position - 1).to_string(),
+      ]);
+    }
+    command.extend([
+      ";".to_string(),
+      "capture-pane".to_string(),
+      "-J".to_string(),
+      "-b".to_string(),
+      joined_buffer.clone(),
+      "-t".to_string(),
+      state.pane_id.clone(),
+    ]);
+    if let Some(scroll_position) = state.scroll_position {
+      command.extend([
+        "-S".to_string(),
+        (-scroll_position).to_string(),
+        "-E".to_string(),
+        (state.height - scroll_position - 1).to_string(),
+      ]);
+    }
+    command.extend([
+      ";".to_string(),
+      "save-buffer".to_string(),
+      "-b".to_string(),
+      screen_buffer.clone(),
+      screen_path,
+      ";".to_string(),
+      "save-buffer".to_string(),
+      "-b".to_string(),
+      joined_buffer.clone(),
+      joined_path,
+      ";".to_string(),
+      "delete-buffer".to_string(),
+      "-b".to_string(),
+      screen_buffer,
+      ";".to_string(),
+      "delete-buffer".to_string(),
+      "-b".to_string(),
+      joined_buffer,
+    ]);
+    self.executor.execute(command);
+    self.executor.last_succeeded()
+  }
+
+  fn capture_stable_snapshot(&mut self) -> Result<(), SnapshotError> {
+    if self.prepare_runtime_dir().is_err() {
+      return Err(SnapshotError::RuntimeSetupFailed);
+    }
+
+    for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
+      let before = self.read_active_pane_state();
+      self.use_pane_state(&before);
+      if !self.capture_snapshot_files(&before) {
+        self.cleanup_runtime_dir();
+        return Err(SnapshotError::CaptureFailed);
+      }
+      let after = self.read_active_pane_state();
+      if before.is_stable_after(&after) {
+        self.use_pane_state(&before);
+        return Ok(());
+      }
+    }
+
+    self.cleanup_runtime_dir();
+    Err(SnapshotError::PaneChanged)
+  }
+
+  pub fn execute_thumbs(&mut self) -> bool {
     let options_command = vec!["tmux", "show", "-g"];
     let params: Vec<String> = options_command.iter().map(|arg| arg.to_string()).collect();
     let options = self.executor.execute(params);
@@ -220,13 +387,6 @@ impl<'a> Swapper<'a> {
 
     let active_pane_id = self.active_pane_id.as_mut().unwrap().clone();
 
-    let scroll_params =
-      if let (Some(pane_height), Some(scroll_position)) = (self.active_pane_height, self.active_pane_scroll_position) {
-        format!(" -S {} -E {}", -scroll_position, pane_height - scroll_position - 1)
-      } else {
-        "".to_string()
-      };
-
     let active_pane_zoomed = self.active_pane_zoomed.as_mut().unwrap().clone();
     let zoom_command = if active_pane_zoomed {
       format!("tmux resize-pane -t {} -Z;", active_pane_id)
@@ -239,14 +399,19 @@ impl<'a> Swapper<'a> {
       .filter(|width| *width > 0)
       .map(|width| format!(" --pane-width {}", width))
       .unwrap_or_default();
+    let screen_path = shell_quote(&self.snapshot_path("screen").to_string_lossy());
+    let joined_path = shell_quote(&self.snapshot_path("joined").to_string_lossy());
+    let result_path = shell_quote(&self.tmp_file);
+    let thumbs_binary = shell_quote(&format!("{}/target/release/thumbs", self.dir));
 
     let pane_command = format!(
-        "umask 077; tmux capture-pane -N -b {signal}-screen -t {active_pane_id}{scroll_params} \\; capture-pane -J -b {signal}-joined -t {active_pane_id}{scroll_params} \\; save-buffer -b {signal}-screen {tmp}.screen \\; save-buffer -b {signal}-joined {tmp}.joined \\; delete-buffer -b {signal}-screen \\; delete-buffer -b {signal}-joined; {dir}/target/release/thumbs -f '%U:%H' -t {tmp}{pane_width_param} --joined-capture {tmp}.joined {args} < {tmp}.screen; rm -f {tmp}.screen {tmp}.joined; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
+        "umask 077; {thumbs_binary} -f '%U:%H' -t {result_path}{pane_width_param} --joined-capture {joined_path} {args} < {screen_path}; picker_status=$?; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}; exit $picker_status",
         active_pane_id = active_pane_id,
-        scroll_params = scroll_params,
-        dir = self.dir,
-        tmp = self.tmp_file,
+        thumbs_binary = thumbs_binary,
+        result_path = result_path,
         pane_width_param = pane_width_param,
+        screen_path = screen_path,
+        joined_path = joined_path,
         args = args.join(" "),
         zoom_command = zoom_command,
         signal = self.signal
@@ -265,8 +430,13 @@ impl<'a> Swapper<'a> {
     ];
 
     let params: Vec<String> = thumbs_command.iter().map(|arg| arg.to_string()).collect();
+    let thumbs_pane_id = self.executor.execute(params);
+    if !self.executor.last_succeeded() || thumbs_pane_id.is_empty() {
+      return false;
+    }
 
-    self.thumbs_pane_id = Some(self.executor.execute(params));
+    self.thumbs_pane_id = Some(thumbs_pane_id);
+    true
   }
 
   pub fn swap_panes(&mut self) {
@@ -319,18 +489,16 @@ impl<'a> Swapper<'a> {
     self.executor.execute(params);
   }
 
+  pub fn notify_failure(&mut self, message: &str) {
+    let message_command = vec!["tmux".to_string(), "display-message".to_string(), message.to_string()];
+    self.executor.execute(message_command);
+  }
+
   pub fn retrieve_content(&mut self) {
     let retrieve_command = vec!["cat", self.tmp_file.as_str()];
     let params = retrieve_command.iter().map(|arg| arg.to_string()).collect();
 
     self.content = Some(self.executor.execute(params));
-  }
-
-  pub fn destroy_content(&mut self) {
-    let retrieve_command = vec!["rm", self.tmp_file.as_str()];
-    let params = retrieve_command.iter().map(|arg| arg.to_string()).collect();
-
-    self.executor.execute(params);
   }
 
   pub fn send_osc52(&mut self) {}
@@ -443,33 +611,233 @@ mod tests {
 
   struct TestShell {
     outputs: Vec<String>,
-    executed: Option<Vec<String>>,
+    successes: Vec<bool>,
+    last_success: bool,
+    executed: Vec<Vec<String>>,
   }
 
   impl TestShell {
     fn new(outputs: Vec<String>) -> TestShell {
       TestShell {
-        executed: None,
+        successes: vec![true; outputs.len()],
+        executed: Vec::new(),
+        last_success: true,
         outputs,
+      }
+    }
+
+    fn with_results(results: Vec<(String, bool)>) -> TestShell {
+      let (outputs, successes): (Vec<String>, Vec<bool>) = results.into_iter().unzip();
+      TestShell {
+        outputs,
+        successes,
+        last_success: true,
+        executed: Vec::new(),
       }
     }
   }
 
   impl Executor for TestShell {
     fn execute(&mut self, args: Vec<String>) -> String {
-      self.executed = Some(args);
+      self.executed.push(args);
+      self.last_success = self.successes.pop().unwrap();
       self.outputs.pop().unwrap()
     }
 
     fn last_executed(&self) -> Option<Vec<String>> {
-      self.executed.clone()
+      self.executed.last().cloned()
     }
+
+    fn last_succeeded(&self) -> bool {
+      self.last_success
+    }
+  }
+
+  fn pane_state(scroll_position: i32, history_size: usize) -> String {
+    format!(
+      "%97:1:24:120:{}:{}:0:active\n%106:0:24:80::0:0:nope\n",
+      scroll_position, history_size
+    )
+  }
+
+  #[test]
+  fn shell_quotes_runtime_paths_with_spaces_quotes_and_metacharacters() {
+    assert_eq!(
+      shell_quote("/tmp/space dir/it's;fine"),
+      "'/tmp/space dir/it'\"'\"'s;fine'"
+    );
+  }
+
+  #[test]
+  fn rejects_failed_snapshot_command_and_removes_private_runtime_dir() {
+    let mut executor = TestShell::with_results(vec![("".to_string(), false), (pane_state(10, 100), true)]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+    let runtime_dir = swapper.runtime_dir.clone();
+
+    assert_eq!(swapper.capture_stable_snapshot(), Err(SnapshotError::CaptureFailed));
+    assert!(!runtime_dir.exists());
+  }
+
+  #[test]
+  fn does_not_remove_a_preexisting_runtime_path_it_does_not_own() {
+    let mut executor = TestShell::new(Vec::new());
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+    std::fs::create_dir(&swapper.runtime_dir).unwrap();
+    let marker = swapper.runtime_dir.join("not-owned");
+    std::fs::write(&marker, b"keep").unwrap();
+
+    assert_eq!(
+      swapper.capture_stable_snapshot(),
+      Err(SnapshotError::RuntimeSetupFailed)
+    );
+    assert!(marker.exists());
+    std::fs::remove_dir_all(&swapper.runtime_dir).unwrap();
+  }
+
+  #[test]
+  fn creates_private_snapshot_directory_and_files() {
+    let stable = pane_state(10, 100);
+    let mut executor = TestShell::new(vec![stable.clone(), "".to_string(), stable]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    assert_eq!(swapper.capture_stable_snapshot(), Ok(()));
+    assert_eq!(
+      std::fs::metadata(&swapper.runtime_dir).unwrap().permissions().mode() & 0o777,
+      0o700
+    );
+    assert_eq!(
+      std::fs::metadata(swapper.snapshot_path("screen"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777,
+      0o600
+    );
+    assert_eq!(
+      std::fs::metadata(swapper.snapshot_path("joined"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777,
+      0o600
+    );
+    swapper.cleanup_runtime_dir();
+  }
+
+  #[test]
+  fn rejects_failed_picker_window_creation() {
+    let mut executor = TestShell::with_results(vec![("".to_string(), false), ("".to_string(), true)]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+    swapper.active_pane_id = Some("%97".to_string());
+    swapper.active_pane_width = Some(120);
+    swapper.active_pane_zoomed = Some(false);
+
+    assert!(!swapper.execute_thumbs());
+    assert!(swapper.thumbs_pane_id.is_none());
+  }
+
+  #[test]
+  fn retries_snapshot_when_copy_mode_state_changes_during_capture() {
+    let before_first = pane_state(10, 100);
+    let after_first = pane_state(11, 101);
+    let before_second = after_first.clone();
+    let after_second = after_first.clone();
+    let mut executor = TestShell::new(vec![
+      after_second,
+      "".to_string(),
+      before_second,
+      after_first,
+      "".to_string(),
+      before_first,
+    ]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    assert_eq!(swapper.capture_stable_snapshot(), Ok(()));
+    swapper.cleanup_runtime_dir();
+    drop(swapper);
+
+    let capture_attempts = executor
+      .executed
+      .iter()
+      .filter(|command| command.get(1).map(String::as_str) == Some("capture-pane"))
+      .count();
+    assert_eq!(capture_attempts, 2);
+  }
+
+  #[test]
+  fn rejects_snapshot_after_three_copy_mode_state_changes() {
+    let mut executor = TestShell::new(vec![
+      pane_state(13, 103),
+      "".to_string(),
+      pane_state(12, 102),
+      pane_state(12, 102),
+      "".to_string(),
+      pane_state(11, 101),
+      pane_state(11, 101),
+      "".to_string(),
+      pane_state(10, 100),
+    ]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    let runtime_dir = swapper.runtime_dir.clone();
+    assert_eq!(swapper.capture_stable_snapshot(), Err(SnapshotError::PaneChanged));
+    drop(swapper);
+
+    let capture_attempts = executor
+      .executed
+      .iter()
+      .filter(|command| command.get(1).map(String::as_str) == Some("capture-pane"))
+      .count();
+    assert_eq!(capture_attempts, 3);
+    assert!(!runtime_dir.exists());
   }
 
   #[test]
   fn retrieve_active_pane() {
     let last_command_outputs =
-      vec!["%97:100:24:120:1:0:active\n%106:100:24:80:1:0:nope\n%107:100:24:80:1:0:nope\n".to_string()];
+      vec!["%97:1:24:120:1:100:0:active\n%106:0:24:80::100:0:nope\n%107:0:24:80::100:0:nope\n".to_string()];
     let mut executor = TestShell::new(last_command_outputs);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
@@ -499,7 +867,6 @@ mod tests {
       false,
     );
     swapper.active_pane_id = Some("%97".to_string());
-    swapper.active_pane_height = Some(24);
     swapper.active_pane_width = Some(120);
     swapper.active_pane_zoomed = Some(false);
 
@@ -522,10 +889,10 @@ mod tests {
       false,
     );
     first.active_pane_id = Some("%97".to_string());
-    first.active_pane_height = Some(24);
     first.active_pane_width = Some(120);
     first.active_pane_zoomed = Some(false);
     first.execute_thumbs();
+    let first_runtime_dir = first.runtime_dir.to_string_lossy().into_owned();
     let first_command = first_executor.last_executed().unwrap().last().unwrap().clone();
 
     let mut second = Swapper::new(
@@ -537,14 +904,15 @@ mod tests {
       false,
     );
     second.active_pane_id = Some("%98".to_string());
-    second.active_pane_height = Some(24);
     second.active_pane_width = Some(120);
     second.active_pane_zoomed = Some(false);
     second.execute_thumbs();
+    let second_runtime_dir = second.runtime_dir.to_string_lossy().into_owned();
     let second_command = second_executor.last_executed().unwrap().last().unwrap().clone();
 
-    assert!(first_command.contains("/tmp/thumbs-last-"));
-    assert!(second_command.contains("/tmp/thumbs-last-"));
+    assert!(first_command.contains(&first_runtime_dir));
+    assert!(second_command.contains(&second_runtime_dir));
+    assert_ne!(first_runtime_dir, second_runtime_dir);
     assert_ne!(first_command, second_command);
   }
 
@@ -554,7 +922,7 @@ mod tests {
       "".to_string(),
       "%100".to_string(),
       "".to_string(),
-      "%106:100:24:80:1:0:nope\n%98:100:24:120:1:0:active\n%107:100:24:80:1:0:nope\n".to_string(),
+      "%106:0:24:80::100:0:nope\n%98:1:24:120:1:100:0:active\n%107:0:24:80::100:0:nope\n".to_string(),
     ];
     let mut executor = TestShell::new(last_command_outputs);
     let mut swapper = Swapper::new(
@@ -677,14 +1045,26 @@ fn main() -> std::io::Result<()> {
     osc52,
   );
 
-  swapper.capture_active_pane();
-  swapper.execute_thumbs();
+  if let Err(error) = swapper.capture_stable_snapshot() {
+    let message = match error {
+      SnapshotError::RuntimeSetupFailed => "tmux-thumbs: failed to create private snapshot directory",
+      SnapshotError::CaptureFailed => "tmux-thumbs: failed to capture pane; retry",
+      SnapshotError::PaneChanged => "tmux-thumbs: pane changed during capture; retry",
+    };
+    swapper.notify_failure(message);
+    return Ok(());
+  }
+  if !swapper.execute_thumbs() {
+    swapper.cleanup_runtime_dir();
+    swapper.notify_failure("tmux-thumbs: failed to create picker window");
+    return Ok(());
+  }
   swapper.swap_panes();
   swapper.resize_pane();
   swapper.wait_thumbs();
   swapper.retrieve_content();
-  swapper.destroy_content();
   swapper.execute_command();
+  swapper.cleanup_runtime_dir();
 
   Ok(())
 }
