@@ -143,22 +143,22 @@ run_path_case() {
   fail "${session_name} copied an incomplete path"
 }
 
-BASE='/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_card_admin/openspec/changes/'
+BASE='/workspace/example-org/example-product/example-service/example-repository/api/spec/changes/'
 run_path_case \
   'exact-edge' \
-  "      - ${BASE}life-service-card-admin-compatibility" \
+  "      - ${BASE}example-service-feature-compatibility" \
   '        /proposal.md：明确使用' \
-  "${BASE}life-service-card-admin-compatibility/proposal.md"
+  "${BASE}example-service-feature-compatibility/proposal.md"
 run_path_case \
   'word-boundary' \
-  "      - ${BASE}life-service-card-admin-" \
+  "      - ${BASE}example-service-feature-" \
   '        compatibility/design.md：命令实际解析版本为权威' \
-  "${BASE}life-service-card-admin-compatibility/design.md"
+  "${BASE}example-service-feature-compatibility/design.md"
 run_path_case \
   'metadata-boundary' \
-  ' Directory:            /data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits' \
+  ' Directory:            /workspace/example-org/example-product/example-service/example-repository/worker/optimize-pipeline-job' \
   ' Permissions:          Full Access' \
-  '/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits'
+  '/workspace/example-org/example-product/example-service/example-repository/worker/optimize-pipeline-job'
 run_path_case \
   'glob' \
   'specs/**/*.md 与 grill-spec.md 已复核' \
@@ -190,7 +190,7 @@ def wait_for(check):
         time.sleep(0.02)
     raise AssertionError("timed out waiting for isolated terminal")
 
-def run_case(name, text, expected, width, raw=False, marker=None, plain_prefix=None):
+def run_case(name, text, expected, width, raw=False, marker=None, plain_prefix=None, hint="a"):
     ready = name + "-ready"
     code = (
         "import sys,subprocess,time; sys.stdout.write(" + repr(text) + "); sys.stdout.flush(); "
@@ -214,10 +214,10 @@ def run_case(name, text, expected, width, raw=False, marker=None, plain_prefix=N
             if pane == source:
                 return None
             screen = tmux("capture-pane", "-p", "-t", pane)
-            return (pane, screen) if "[a]" in screen else None
+            return (pane, screen) if "[" + hint + "]" in screen else None
         pane, overlay = wait_for(ready_overlay)
         after = overlay.splitlines()
-        assert overlay.count("[a]") == 1, (name, overlay)
+        assert overlay.count("[" + hint + "]") == 1, (name, hint, overlay)
         if marker:
             row = next(i for i, line in enumerate(before) if marker in line)
             assert after[row] == before[row], (name, "unrelated row changed", before, after)
@@ -230,7 +230,7 @@ def run_case(name, text, expected, width, raw=False, marker=None, plain_prefix=N
                 for old, new in zip(before, after):
                     if old.startswith(prefix):
                         assert new.startswith(prefix), (name, old, new)
-        tmux("send-keys", "-t", pane, "-l", "a")
+        tmux("send-keys", "-t", pane, "-l", hint)
         wait_for(lambda: result.exists())
         assert result.read_text() == expected, (name, expected, result.read_text())
         wait_for(lambda: tmux("list-panes", "-t", window, "-F", "#{pane_id}").strip() == source)
@@ -247,6 +247,26 @@ relative = "./.ai_doc/records/inbox/design.md"
 run_case("cjk-root", "◆ 详细方案已写入" + relative + "，推荐\r\n", relative, 80, plain_prefix="◆ 详细方案已写入./")
 filename = "skill-eval-review-report-20260912.md"
 run_case("bare-filename", "◆ 已写成本地 Markdown 文档：\r\n\r\n" + filename + "\r\n", filename, 80)
+
+table_paths = (
+    "  9 handleResult:47 (src/engine/materials/data_loader/                                  reports metrics\r\n"
+    "    data_loader_helper.go:47) -> relay:70 (src/engine/tracer/\r\n"
+    "    request_tracer.go:70)\r\n"
+)
+run_case(
+    "table-path-first",
+    table_paths,
+    "src/engine/materials/data_loader/data_loader_helper.go:47",
+    160,
+    hint="a",
+)
+run_case(
+    "table-path-second",
+    table_paths,
+    "src/engine/tracer/request_tracer.go:70",
+    160,
+    hint="b",
+)
 
 prefix = "  │ && stat -c '%a %s %n' /workspace/.ai_doc/records/"
 suffix = "  │ inbox/2026-09-12-portable-core-plugin-design.md"

@@ -72,9 +72,10 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize, soft_wra
       None => break,
     };
     let token = &next[span.start..span.end];
-    if !reaches_wrap_boundary(current, pending.spans.last().unwrap(), token, pane_width)
-      || !is_confident_continuation(pending.pattern, &pending.text, token)
-    {
+    let reaches_boundary = reaches_wrap_boundary(current, pending.spans.last().unwrap(), token, pane_width)
+      || (pending.pattern == "path"
+        && is_parenthesized_cell_continuation(current, pending.spans.last().unwrap(), next, &span, &pending.text));
+    if !reaches_boundary || !is_confident_continuation(pending.pattern, &pending.text, token) {
       break;
     }
 
@@ -158,6 +159,41 @@ fn reaches_wrap_boundary(line: &str, span: &ScreenSpan, continuation: &str, pane
   span.end == visible.len()
     && (visible.width() >= pane_width
       || (has_strong_path_structure(continuation) && visible.width() + continuation.width() > pane_width))
+}
+
+fn is_parenthesized_cell_continuation(
+  current: &str,
+  current_span: &ScreenSpan,
+  next: &str,
+  next_span: &ScreenSpan,
+  accumulated: &str,
+) -> bool {
+  if !accumulated.ends_with('/') {
+    return false;
+  }
+
+  let current_prefix = &current[..current_span.start];
+  let next_prefix = &next[..next_span.start];
+  if next_prefix.width() >= current_prefix.width() {
+    return false;
+  }
+
+  let opener = match current_prefix.chars().next_back() {
+    Some(opener) => opener,
+    None => return false,
+  };
+  let closes_inside_span = next[next_span.start..next_span.end]
+    .chars()
+    .next_back()
+    .map(|closer| closes(opener, closer))
+    .unwrap_or(false);
+  let closes_after_span = next[next_span.end..]
+    .chars()
+    .next()
+    .map(|closer| closes(opener, closer))
+    .unwrap_or(false);
+
+  closes_inside_span || closes_after_span
 }
 
 fn continuation_span(pattern: &str, line: &str, start: usize, accumulated: &str) -> Option<ScreenSpan> {
@@ -323,11 +359,13 @@ pub fn boundary_range(text: &str, pattern: &str) -> (usize, usize) {
       _ => break,
     };
 
-    if matching_close_at_end(bounded, first) {
-      start += first.len_utf8();
-      end -= bounded.chars().last().unwrap().len_utf8();
-    } else {
-      break;
+    match first_matching_close_end(bounded, first) {
+      Some(close_end) if close_end == bounded.len() => {
+        start += first.len_utf8();
+        end -= bounded.chars().last().unwrap().len_utf8();
+      }
+      Some(_) => break,
+      None => start += first.len_utf8(),
     }
   }
 
@@ -380,7 +418,7 @@ fn boundary_len(text: &str, pattern: &str) -> usize {
   trim_terminal_punctuation(&text[..end], pattern)
 }
 
-fn matching_close_at_end(text: &str, first: char) -> bool {
+fn first_matching_close_end(text: &str, first: char) -> Option<usize> {
   let mut stack = Vec::new();
 
   for (index, ch) in text.char_indices() {
@@ -389,18 +427,18 @@ fn matching_close_at_end(text: &str, first: char) -> bool {
       ')' | ']' | '）' | '】' => {
         let open = match stack.pop() {
           Some(open) if closes(open, ch) => open,
-          _ => return false,
+          _ => return None,
         };
 
         if open == first && stack.is_empty() {
-          return index + ch.len_utf8() == text.len();
+          return Some(index + ch.len_utf8());
         }
       }
       _ => {}
     }
   }
 
-  false
+  None
 }
 
 fn closes(open: char, close: char) -> bool {
@@ -490,6 +528,7 @@ mod tests {
   fn balanced_internal_delimiters_are_preserved() {
     assert_url("https://host/wiki/Foo_(bar)。", "https://host/wiki/Foo_(bar)", 0);
     assert_path("app/(main)/[id]/index.tsx)。", "app/(main)/[id]/index.tsx", 0);
+    assert_path("(generated)/main.go", "(generated)/main.go", 0);
   }
 
   #[test]
@@ -510,6 +549,15 @@ mod tests {
       1,
     );
     assert_path("(path/file.md).", "path/file.md", 1);
+  }
+
+  #[test]
+  fn path_excludes_unmatched_outer_opener_before_location_closer() {
+    assert_path(
+      "(src/engine/materials/data_loader/data_load_executor.go:120):",
+      "src/engine/materials/data_loader/data_load_executor.go:120",
+      1,
+    );
   }
 
   #[test]
@@ -598,28 +646,28 @@ mod tests {
 
   #[test]
   fn joins_tui_word_wrapped_paths_before_the_pane_edge() {
-    let base = "/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_card_admin/openspec/changes/";
+    let base = "/workspace/example-org/example-product/example-service/example-repository/api/spec/changes/";
     let cases = [
       (
         format!(
-          "      - {}life-service-card-admin-compatibility\n        /proposal.md：明确使用",
+          "      - {}example-service-feature-compatibility\n        /proposal.md：明确使用",
           base
         ),
-        format!("{}life-service-card-admin-compatibility/proposal.md", base),
+        format!("{}example-service-feature-compatibility/proposal.md", base),
       ),
       (
         format!(
-          "      - {}life-service-card-admin-\n        compatibility/design.md：命令实际解析",
+          "      - {}example-service-feature-\n        compatibility/design.md：命令实际解析",
           base
         ),
-        format!("{}life-service-card-admin-compatibility/design.md", base),
+        format!("{}example-service-feature-compatibility/design.md", base),
       ),
       (
         format!(
-          "  - {}life-service-card-admin-compatibility/\n    revise.md 已恢复",
+          "  - {}example-service-feature-compatibility/\n    revise.md 已恢复",
           base
         ),
-        format!("{}life-service-card-admin-compatibility/revise.md", base),
+        format!("{}example-service-feature-compatibility/revise.md", base),
       ),
     ];
 
@@ -628,6 +676,47 @@ mod tests {
       assert_eq!(candidate.text, expected, "input: {:?}", input);
       assert_eq!(candidate.spans.len(), 2, "input: {:?}", input);
     }
+  }
+
+  #[test]
+  fn joins_multiple_parenthesized_paths_across_table_cell_lines() {
+    let input = concat!(
+      "  9 handleResult:47 (src/engine/materials/data_loader/                                  reports metrics\n",
+      "    data_loader_helper.go:47) -> relay:70 (src/engine/tracer/\n",
+      "    request_tracer.go:70)"
+    );
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let custom = vec![];
+    let results = State::new(&lines, "abcd", &custom, Some(160)).matches(false, false);
+    let paths = results
+      .iter()
+      .filter(|candidate| candidate.pattern == "path")
+      .collect::<Vec<_>>();
+
+    assert_eq!(
+      paths
+        .iter()
+        .map(|candidate| candidate.text.as_str())
+        .collect::<Vec<_>>(),
+      [
+        "src/engine/materials/data_loader/data_loader_helper.go:47",
+        "src/engine/tracer/request_tracer.go:70",
+      ]
+    );
+    assert!(paths.iter().all(|candidate| candidate.spans.len() == 2));
+  }
+
+  #[test]
+  fn does_not_join_cell_continuation_without_matching_closer() {
+    let input = "  item (src/engine/\n    unrelated.go";
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let custom = vec![];
+    let results = State::new(&lines, "abcd", &custom, Some(160)).matches(false, false);
+
+    assert!(results
+      .iter()
+      .filter(|candidate| candidate.pattern == "path")
+      .all(|candidate| candidate.spans.len() == 1));
   }
 
   #[test]
@@ -642,36 +731,36 @@ mod tests {
 
   #[test]
   fn does_not_join_a_complete_path_with_a_following_metadata_field() {
-    let input = " Directory:            /data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits\n Permissions:          Full Access";
+    let input = " Directory:            /workspace/example-org/example-product/example-service/example-repository/worker/optimize-pipeline-job\n Permissions:          Full Access";
     let lines = input.split('\n').collect::<Vec<_>>();
     let custom = vec![];
     let results = State::new(&lines, "abcd", &custom, Some(136)).matches(false, false);
     let path = results
       .iter()
-      .find(|candidate| candidate.pattern == "path" && candidate.text.starts_with("/data00/"))
+      .find(|candidate| candidate.pattern == "path" && candidate.text.starts_with("/workspace/"))
       .expect("directory path candidate");
 
     assert_eq!(
       path.text,
-      "/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits"
+      "/workspace/example-org/example-product/example-service/example-repository/worker/optimize-pipeline-job"
     );
     assert_eq!(path.spans.len(), 1);
   }
 
   #[test]
   fn does_not_join_a_metadata_field_that_contains_path_punctuation() {
-    let input = " Directory:            /data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits\n Agents.md:            AGENTS.md";
+    let input = " Directory:            /workspace/example-org/example-product/example-service/example-repository/worker/optimize-pipeline-job\n Agents.md:            AGENTS.md";
     let lines = input.split('\n').collect::<Vec<_>>();
     let custom = vec![];
     let results = State::new(&lines, "abcd", &custom, Some(130)).matches(false, false);
     let path = results
       .iter()
-      .find(|candidate| candidate.pattern == "path" && candidate.text.starts_with("/data00/"))
+      .find(|candidate| candidate.pattern == "path" && candidate.text.starts_with("/workspace/"))
       .expect("directory path candidate");
 
     assert_eq!(
       path.text,
-      "/data00/home/lihao.hellohake/go/src/code.byted.org/ecom/search_stream/optimize-engine-pre-intent-waits"
+      "/workspace/example-org/example-product/example-service/example-repository/worker/optimize-pipeline-job"
     );
     assert_eq!(path.spans.len(), 1);
   }
