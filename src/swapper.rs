@@ -62,13 +62,18 @@ fn shell_quote(value: &str) -> String {
   format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Viewport {
+  Live,
+  CopyMode { scroll_position: i32 },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaneState {
   pane_id: String,
-  in_mode: bool,
+  viewport: Viewport,
   height: i32,
   width: usize,
-  scroll_position: Option<i32>,
   history_size: usize,
   zoomed: bool,
 }
@@ -78,16 +83,30 @@ enum SnapshotError {
   RuntimeSetupFailed,
   CaptureFailed,
   PaneChanged,
+  SourcePaneUnavailable,
+  ViewportUnavailable,
 }
 
 impl PaneState {
   fn is_stable_after(&self, other: &PaneState) -> bool {
-    self.pane_id == other.pane_id
-      && self.in_mode == other.in_mode
-      && self.height == other.height
-      && self.width == other.width
-      && self.zoomed == other.zoomed
-      && (!self.in_mode || (self.scroll_position == other.scroll_position && self.history_size == other.history_size))
+    if self.pane_id != other.pane_id
+      || self.height != other.height
+      || self.width != other.width
+      || self.zoomed != other.zoomed
+    {
+      return false;
+    }
+
+    match (&self.viewport, &other.viewport) {
+      (Viewport::Live, Viewport::Live) => true,
+      (
+        Viewport::CopyMode {
+          scroll_position: before,
+        },
+        Viewport::CopyMode { scroll_position: after },
+      ) => before == after && self.history_size == other.history_size,
+      _ => false,
+    }
   }
 }
 
@@ -105,6 +124,7 @@ fn dbg(msg: &str) {
 
 pub struct Swapper<'a> {
   executor: Box<&'a mut dyn Executor>,
+  source_pane_id: String,
   dir: String,
   command: String,
   upcase_command: String,
@@ -123,6 +143,7 @@ pub struct Swapper<'a> {
 impl<'a> Swapper<'a> {
   fn new(
     executor: Box<&'a mut dyn Executor>,
+    source_pane_id: String,
     dir: String,
     command: String,
     upcase_command: String,
@@ -146,6 +167,7 @@ impl<'a> Swapper<'a> {
 
     Swapper {
       executor,
+      source_pane_id,
       dir,
       command,
       upcase_command,
@@ -162,53 +184,50 @@ impl<'a> Swapper<'a> {
     }
   }
 
-  fn read_active_pane_state(&mut self) -> PaneState {
-    let active_command = vec![
-      "tmux",
-      "list-panes",
-      "-F",
-      "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{pane_width}:#{scroll_position}:#{history_size}:#{window_zoomed_flag}:#{?pane_active,active,nope}",
+  fn read_source_pane_state(&mut self) -> Result<PaneState, SnapshotError> {
+    let state_command = vec![
+      "tmux".to_string(),
+      "display-message".to_string(),
+      "-p".to_string(),
+      "-t".to_string(),
+      self.source_pane_id.clone(),
+      "#{pane_id}:#{pane_mode}:#{pane_height}:#{pane_width}:#{scroll_position}:#{history_size}:#{window_zoomed_flag}"
+        .to_string(),
     ];
-
-    let output = self
-      .executor
-      .execute(active_command.iter().map(|arg| arg.to_string()).collect());
-
-    let lines: Vec<&str> = output.split('\n').collect();
-    let chunks: Vec<Vec<&str>> = lines.into_iter().map(|line| line.split(':').collect()).collect();
-
-    let active_pane = chunks
-      .iter()
-      .find(|&chunks| *chunks.get(7).unwrap() == "active")
-      .expect("Unable to find active pane");
-
-    let in_mode = *active_pane.get(1).expect("Unable to retrieve pane mode") == "1";
-    let scroll_position = active_pane
-      .get(4)
-      .filter(|value| in_mode && !value.is_empty())
-      .map(|value| value.parse().expect("Unable to retrieve pane scroll"));
-
-    PaneState {
-      pane_id: active_pane.get(0).expect("Unable to retrieve pane id").to_string(),
-      in_mode,
-      height: active_pane
-        .get(2)
-        .expect("Unable to retrieve pane height")
-        .parse()
-        .expect("Unable to retrieve pane height"),
-      width: active_pane
-        .get(3)
-        .expect("Unable to retrieve pane width")
-        .parse()
-        .expect("Unable to retrieve pane width"),
-      scroll_position,
-      history_size: active_pane
-        .get(5)
-        .expect("Unable to retrieve pane history size")
-        .parse()
-        .expect("Unable to retrieve pane history size"),
-      zoomed: *active_pane.get(6).expect("Unable to retrieve zoom pane property") == "1",
+    let output = self.executor.execute(state_command);
+    if !self.executor.last_succeeded() {
+      return Err(SnapshotError::SourcePaneUnavailable);
     }
+
+    let fields = output.split(':').collect::<Vec<_>>();
+    if fields.len() != 7 || fields[0] != self.source_pane_id {
+      return Err(SnapshotError::SourcePaneUnavailable);
+    }
+
+    let viewport = match fields[1] {
+      "" => Viewport::Live,
+      "copy-mode" => {
+        let scroll_position = fields[4]
+          .parse::<i32>()
+          .ok()
+          .filter(|value| *value >= 0)
+          .ok_or(SnapshotError::ViewportUnavailable)?;
+        Viewport::CopyMode { scroll_position }
+      }
+      _ => return Err(SnapshotError::ViewportUnavailable),
+    };
+    let height = fields[2].parse().map_err(|_| SnapshotError::SourcePaneUnavailable)?;
+    let width = fields[3].parse().map_err(|_| SnapshotError::SourcePaneUnavailable)?;
+    let history_size = fields[5].parse().map_err(|_| SnapshotError::SourcePaneUnavailable)?;
+
+    Ok(PaneState {
+      pane_id: fields[0].to_string(),
+      viewport,
+      height,
+      width,
+      history_size,
+      zoomed: fields[6] == "1",
+    })
   }
 
   fn use_pane_state(&mut self, state: &PaneState) {
@@ -218,7 +237,7 @@ impl<'a> Swapper<'a> {
   }
 
   pub fn capture_active_pane(&mut self) {
-    let state = self.read_active_pane_state();
+    let state = self.read_source_pane_state().expect("Unable to retrieve source pane");
     self.use_pane_state(&state);
   }
 
@@ -264,7 +283,7 @@ impl<'a> Swapper<'a> {
       "-t".to_string(),
       state.pane_id.clone(),
     ];
-    if let Some(scroll_position) = state.scroll_position {
+    if let Viewport::CopyMode { scroll_position } = state.viewport {
       command.extend([
         "-S".to_string(),
         (-scroll_position).to_string(),
@@ -281,7 +300,7 @@ impl<'a> Swapper<'a> {
       "-t".to_string(),
       state.pane_id.clone(),
     ]);
-    if let Some(scroll_position) = state.scroll_position {
+    if let Viewport::CopyMode { scroll_position } = state.viewport {
       command.extend([
         "-S".to_string(),
         (-scroll_position).to_string(),
@@ -319,13 +338,25 @@ impl<'a> Swapper<'a> {
     }
 
     for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
-      let before = self.read_active_pane_state();
+      let before = match self.read_source_pane_state() {
+        Ok(state) => state,
+        Err(error) => {
+          self.cleanup_runtime_dir();
+          return Err(error);
+        }
+      };
       self.use_pane_state(&before);
       if !self.capture_snapshot_files(&before) {
         self.cleanup_runtime_dir();
         return Err(SnapshotError::CaptureFailed);
       }
-      let after = self.read_active_pane_state();
+      let after = match self.read_source_pane_state() {
+        Ok(state) => state,
+        Err(error) => {
+          self.cleanup_runtime_dir();
+          return Err(error);
+        }
+      };
       if before.is_stable_after(&after) {
         self.use_pane_state(&before);
         return Ok(());
@@ -654,10 +685,153 @@ mod tests {
   }
 
   fn pane_state(scroll_position: i32, history_size: usize) -> String {
-    format!(
-      "%97:1:24:120:{}:{}:0:active\n%106:0:24:80::0:0:nope\n",
-      scroll_position, history_size
-    )
+    copy_state("%97", &scroll_position.to_string(), history_size)
+  }
+
+  fn copy_state(pane_id: &str, scroll_position: &str, history_size: usize) -> String {
+    format!("{}:copy-mode:24:120:{}:{}:0", pane_id, scroll_position, history_size)
+  }
+
+  fn live_state(pane_id: &str, history_size: usize) -> String {
+    format!("{}::24:120::{}:0", pane_id, history_size)
+  }
+
+  #[test]
+  fn queries_the_explicit_source_pane() {
+    let stable = copy_state("%97", "10", 100);
+    let mut executor = TestShell::new(vec![stable.clone(), "".to_string(), stable]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "%97".to_string(),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    assert_eq!(swapper.capture_stable_snapshot(), Ok(()));
+    swapper.cleanup_runtime_dir();
+    drop(swapper);
+
+    let state_commands = executor
+      .executed
+      .iter()
+      .filter(|command| command.get(1).map(String::as_str) == Some("display-message"))
+      .collect::<Vec<_>>();
+    assert_eq!(state_commands.len(), 2);
+    assert!(state_commands
+      .iter()
+      .all(|command| command.windows(2).any(|pair| pair == ["-t", "%97"])));
+  }
+
+  #[test]
+  fn rejects_copy_mode_without_scroll_position() {
+    let invalid = copy_state("%97", "", 100);
+    let mut executor = TestShell::new(vec![invalid]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "%97".to_string(),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    assert_eq!(
+      swapper.capture_stable_snapshot(),
+      Err(SnapshotError::ViewportUnavailable)
+    );
+    drop(swapper);
+    assert!(executor
+      .executed
+      .iter()
+      .all(|command| command.get(1).map(String::as_str) != Some("capture-pane")));
+  }
+
+  #[test]
+  fn rejects_invalid_copy_mode_scroll_positions() {
+    for scroll_position in ["-1", "invalid"] {
+      let mut executor = TestShell::new(vec![copy_state("%97", scroll_position, 100)]);
+      let mut swapper = Swapper::new(
+        Box::new(&mut executor),
+        "%97".to_string(),
+        "/tmp/tmux-thumbs".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "".to_string(),
+        false,
+      );
+      assert_eq!(
+        swapper.capture_stable_snapshot(),
+        Err(SnapshotError::ViewportUnavailable),
+        "scroll_position={}",
+        scroll_position
+      );
+    }
+  }
+
+  #[test]
+  fn rejects_a_state_for_another_pane() {
+    let mut executor = TestShell::new(vec![copy_state("%98", "10", 100)]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "%97".to_string(),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    assert_eq!(
+      swapper.capture_stable_snapshot(),
+      Err(SnapshotError::SourcePaneUnavailable)
+    );
+  }
+
+  #[test]
+  fn accepts_live_viewport_without_scroll_range() {
+    let stable = live_state("%97", 100);
+    let mut executor = TestShell::new(vec![stable.clone(), "".to_string(), stable]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "%97".to_string(),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    assert_eq!(swapper.capture_stable_snapshot(), Ok(()));
+    swapper.cleanup_runtime_dir();
+    drop(swapper);
+    let capture = executor
+      .executed
+      .iter()
+      .find(|command| command.get(1).map(String::as_str) == Some("capture-pane"))
+      .expect("capture command");
+    assert!(!capture.iter().any(|argument| argument == "-S" || argument == "-E"));
+  }
+
+  #[test]
+  fn rejects_unsupported_pane_modes() {
+    let mut executor = TestShell::new(vec!["%97:clock-mode:24:120::100:0".to_string()]);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "%97".to_string(),
+      "/tmp/tmux-thumbs".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+    assert_eq!(
+      swapper.capture_stable_snapshot(),
+      Err(SnapshotError::ViewportUnavailable)
+    );
   }
 
   #[test]
@@ -673,6 +847,7 @@ mod tests {
     let mut executor = TestShell::with_results(vec![("".to_string(), false), (pane_state(10, 100), true)]);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -690,6 +865,7 @@ mod tests {
     let mut executor = TestShell::new(Vec::new());
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -714,6 +890,7 @@ mod tests {
     let mut executor = TestShell::new(vec![stable.clone(), "".to_string(), stable]);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -750,6 +927,7 @@ mod tests {
     let mut executor = TestShell::with_results(vec![("".to_string(), false), ("".to_string(), true)]);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -780,6 +958,7 @@ mod tests {
     ]);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -814,6 +993,7 @@ mod tests {
     ]);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -836,11 +1016,11 @@ mod tests {
 
   #[test]
   fn retrieve_active_pane() {
-    let last_command_outputs =
-      vec!["%97:1:24:120:1:100:0:active\n%106:0:24:80::100:0:nope\n%107:0:24:80::100:0:nope\n".to_string()];
+    let last_command_outputs = vec![copy_state("%97", "1", 100)];
     let mut executor = TestShell::new(last_command_outputs);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "".to_string(),
       "".to_string(),
       "".to_string(),
@@ -860,6 +1040,7 @@ mod tests {
     let mut executor = TestShell::new(last_command_outputs);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -882,6 +1063,7 @@ mod tests {
     let mut second_executor = TestShell::new(vec!["%101".to_string(), "".to_string()]);
     let mut first = Swapper::new(
       Box::new(&mut first_executor),
+      "%97".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -897,6 +1079,7 @@ mod tests {
 
     let mut second = Swapper::new(
       Box::new(&mut second_executor),
+      "%98".to_string(),
       "/tmp/tmux-thumbs".to_string(),
       "".to_string(),
       "".to_string(),
@@ -922,11 +1105,12 @@ mod tests {
       "".to_string(),
       "%100".to_string(),
       "".to_string(),
-      "%106:0:24:80::100:0:nope\n%98:1:24:120:1:100:0:active\n%107:0:24:80::100:0:nope\n".to_string(),
+      copy_state("%98", "1", 100),
     ];
     let mut executor = TestShell::new(last_command_outputs);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%98".to_string(),
       "".to_string(),
       "".to_string(),
       "".to_string(),
@@ -953,6 +1137,7 @@ mod tests {
     let multi_command = "open \"{}\"".to_string();
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
+      "%97".to_string(),
       "".to_string(),
       user_command,
       upcase_command,
@@ -997,6 +1182,13 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .default_value(""),
     )
     .arg(
+      Arg::with_name("pane_id")
+        .help("Source tmux pane to capture")
+        .long("pane-id")
+        .takes_value(true)
+        .required(true),
+    )
+    .arg(
       Arg::with_name("command")
         .help("Command to execute after choose a hint")
         .long("command")
@@ -1025,6 +1217,7 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
 
 fn main() -> std::io::Result<()> {
   let args = app_args();
+  let source_pane_id = args.value_of("pane_id").unwrap();
   let dir = args.value_of("dir").unwrap();
   let command = args.value_of("command").unwrap();
   let upcase_command = args.value_of("upcase_command").unwrap();
@@ -1038,6 +1231,7 @@ fn main() -> std::io::Result<()> {
   let mut executor = RealShell::new();
   let mut swapper = Swapper::new(
     Box::new(&mut executor),
+    source_pane_id.to_string(),
     dir.to_string(),
     command.to_string(),
     upcase_command.to_string(),
@@ -1050,6 +1244,8 @@ fn main() -> std::io::Result<()> {
       SnapshotError::RuntimeSetupFailed => "tmux-thumbs: failed to create private snapshot directory",
       SnapshotError::CaptureFailed => "tmux-thumbs: failed to capture pane; retry",
       SnapshotError::PaneChanged => "tmux-thumbs: pane changed during capture; retry",
+      SnapshotError::SourcePaneUnavailable => "tmux-thumbs: source pane unavailable; retry",
+      SnapshotError::ViewportUnavailable => "tmux-thumbs: copy-mode viewport unavailable; retry",
     };
     swapper.notify_failure(message);
     return Ok(());

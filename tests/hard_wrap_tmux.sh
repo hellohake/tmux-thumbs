@@ -49,7 +49,7 @@ grep -Fq '  life-card-admin-20260911-01a08c45/handoff.md)。' <<<"${SOURCE_CAPTU
 grep -Fq '（https://host/a），发布于' <<<"${SOURCE_CAPTURE}" || fail 'URL and adjacent Chinese prose are missing'
 
 tmux -L "${SOCKET_NAME}" run-shell -b -t "${SOURCE_PANE}" \
-  "${ROOT_DIR}/target/release/tmux-thumbs --dir '${ROOT_DIR}'"
+  "${ROOT_DIR}/target/release/tmux-thumbs --pane-id '${SOURCE_PANE}' --dir '${ROOT_DIR}'"
 
 thumbs_is_running() {
   test "$(tmux -L "${SOCKET_NAME}" list-panes -t "${SOURCE_WINDOW}" -F '#{pane_id}')" != "${SOURCE_PANE}"
@@ -94,7 +94,7 @@ source_pane_is_restored() {
 wait_until 'source pane restoration' source_pane_is_restored
 
 tmux -L "${SOCKET_NAME}" run-shell -b -t "${SOURCE_PANE}" \
-  "${ROOT_DIR}/target/release/tmux-thumbs --dir '${ROOT_DIR}'"
+  "${ROOT_DIR}/target/release/tmux-thumbs --pane-id '${SOURCE_PANE}' --dir '${ROOT_DIR}'"
 wait_until 'second thumbs pane' thumbs_is_running
 THUMBS_PANE="$(tmux -L "${SOCKET_NAME}" list-panes -t "${SOURCE_WINDOW}" -F '#{pane_id}')"
 tmux -L "${SOCKET_NAME}" send-keys -t "${THUMBS_PANE}" b
@@ -119,7 +119,7 @@ run_path_case() {
   source_window="$(tmux -L "${SOCKET_NAME}" display-message -p -t "${source_pane}" '#{window_id}')"
 
   tmux -L "${SOCKET_NAME}" run-shell -b -t "${source_pane}" \
-    "${ROOT_DIR}/target/release/tmux-thumbs --dir '${ROOT_DIR}'"
+    "${ROOT_DIR}/target/release/tmux-thumbs --pane-id '${source_pane}' --dir '${ROOT_DIR}'"
   for _ in $(seq 1 100); do
     thumbs_pane="$(tmux -L "${SOCKET_NAME}" list-panes -t "${source_window}" -F '#{pane_id}')"
     if test "${thumbs_pane}" != "${source_pane}"; then
@@ -207,7 +207,12 @@ def run_case(name, text, expected, width, raw=False, marker=None, plain_prefix=N
     with tempfile.TemporaryDirectory(prefix="thumbs-picked-") as tmp:
         result = Path(tmp) / "selected.txt"
         command = 'printf %s "${THUMB}" > ' + shlex.quote(str(result))
-        launcher = shlex.join([root + "/target/release/tmux-thumbs", "--dir", root, "--command", command])
+        launcher = shlex.join([
+            root + "/target/release/tmux-thumbs",
+            "--pane-id", source,
+            "--dir", root,
+            "--command", command,
+        ])
         tmux("run-shell", "-b", "-t", source, launcher)
         def ready_overlay():
             pane = tmux("list-panes", "-t", window, "-F", "#{pane_id}").strip()
@@ -267,6 +272,19 @@ run_case(
     160,
     hint="b",
 )
+
+p90 = "https://metrics.example/plot#now-1h,China-North6,false;max:stage.ms%7Bcard_type=*%7D%7Bstage=literal_or(summary),status=literal_or(success)%7D%5Bpct90%5D;0"
+avg = "https://metrics.example/plot#now-1h,China-North6,false;avg:stage.ms%7Bstage=literal_or(summary)%7D%5Bavg%5D;0"
+table_urls = (
+    "  links P90 (https://metrics.example/plot#now-1h,China-                     note\r\n"
+    "         North6,false;max:stage.ms%7Bcard_\r\n"
+    "         type=*%7D%7Bstage=literal_or(summary),status=literal_or(\r\n"
+    "         success)%7D%5Bpct90%5D;0) / (https://metrics.example/plot#now-\r\n"
+    "         1h,China-North6,false;avg:stage.ms%7Bstage=literal_or(summary)\r\n"
+    "         %7D%5Bavg%5D;0)\r\n"
+)
+run_case("table-url-p90", table_urls, p90, 120, hint="a")
+run_case("table-url-avg", table_urls, avg, 120, hint="b")
 
 prefix = "  │ && stat -c '%a %s %n' /workspace/.ai_doc/records/"
 suffix = "  │ inbox/2026-09-12-portable-core-plugin-design.md"

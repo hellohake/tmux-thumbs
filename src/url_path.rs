@@ -52,6 +52,7 @@ pub fn normalize(
 fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize, soft_wrapped: &[bool]) -> Option<Match> {
   let mut joined = candidate.clone();
   let mut current_line = candidate.spans.last()?.line;
+  let parenthesized_cell_url = parenthesized_cell_url(lines, candidate, soft_wrapped);
 
   while let Some(next) = lines.get(current_line + 1) {
     if soft_wrapped.get(current_line).copied().unwrap_or(false) {
@@ -64,7 +65,15 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize, soft_wra
       Some(start) => start,
       None => break,
     };
-    let span = match continuation_span(pending.pattern, next, start, &pending.text) {
+    let proven_table_url = parenthesized_cell_url
+      .filter(|proof| current_line < proof.close_line && next[..start].width() == proof.continuation_column)
+      .is_some();
+    let continuation = if proven_table_url {
+      table_url_continuation_span(next, start, &pending.text)
+    } else {
+      continuation_span(pending.pattern, next, start, &pending.text)
+    };
+    let span = match continuation {
       Some(span) => ScreenSpan {
         line: current_line + 1,
         ..span
@@ -74,8 +83,9 @@ fn join_candidate(lines: &[&str], candidate: &Match, pane_width: usize, soft_wra
     let token = &next[span.start..span.end];
     let reaches_boundary = reaches_wrap_boundary(current, pending.spans.last().unwrap(), token, pane_width)
       || (pending.pattern == "path"
-        && is_parenthesized_cell_continuation(current, pending.spans.last().unwrap(), next, &span, &pending.text));
-    if !reaches_boundary || !is_confident_continuation(pending.pattern, &pending.text, token) {
+        && is_parenthesized_cell_continuation(current, pending.spans.last().unwrap(), next, &span, &pending.text))
+      || proven_table_url;
+    if !reaches_boundary || (!proven_table_url && !is_confident_continuation(pending.pattern, &pending.text, token)) {
       break;
     }
 
@@ -159,6 +169,78 @@ fn reaches_wrap_boundary(line: &str, span: &ScreenSpan, continuation: &str, pane
   span.end == visible.len()
     && (visible.width() >= pane_width
       || (has_strong_path_structure(continuation) && visible.width() + continuation.width() > pane_width))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParenthesizedCellUrl {
+  continuation_column: usize,
+  close_line: usize,
+}
+
+fn parenthesized_cell_url(lines: &[&str], candidate: &Match, soft_wrapped: &[bool]) -> Option<ParenthesizedCellUrl> {
+  if candidate.pattern != "url" || candidate.spans.len() != 1 {
+    return None;
+  }
+
+  let initial_span = candidate.anchor();
+  let initial_line = *lines.get(initial_span.line)?;
+  let opener = initial_line[..initial_span.start].chars().next_back()?;
+  if !matches!(opener, '(' | '[' | '（' | '【') {
+    return None;
+  }
+
+  let initial_column = initial_line[..initial_span.start].width();
+  let mut continuation_column = None;
+  let mut accumulated = candidate.text.clone();
+  let mut current_line = initial_span.line;
+
+  while let Some(next) = lines.get(current_line + 1) {
+    if soft_wrapped.get(current_line).copied().unwrap_or(false) {
+      return None;
+    }
+    let start = continuation_start(lines[current_line], next)?;
+    let column = next[..start].width();
+    match continuation_column {
+      None if column < initial_column => continuation_column = Some(column),
+      Some(expected) if column == expected => {}
+      _ => return None,
+    }
+
+    let span = table_url_continuation_span(next, start, &accumulated)?;
+    let combined = format!("{}{}", accumulated, &next[span.start..span.end]);
+    let end = boundary_len(&combined, "url");
+    if end < combined.len() {
+      let closer = combined[end..].chars().next()?;
+      return closes(opener, closer).then_some(ParenthesizedCellUrl {
+        continuation_column: continuation_column.unwrap(),
+        close_line: current_line + 1,
+      });
+    }
+
+    accumulated = combined;
+    current_line += 1;
+  }
+
+  None
+}
+
+fn table_url_continuation_span(line: &str, start: usize, accumulated: &str) -> Option<ScreenSpan> {
+  let trimmed = &line[start..];
+  if trimmed.is_empty() || is_blocked_continuation("url", trimmed, accumulated) {
+    return None;
+  }
+
+  let end_in_trimmed = trimmed
+    .char_indices()
+    .take_while(|(_, ch)| is_candidate_char("url", *ch))
+    .last()
+    .map(|(index, ch)| index + ch.len_utf8())?;
+
+  Some(ScreenSpan {
+    line: 0,
+    start,
+    end: start + end_in_trimmed,
+  })
 }
 
 fn is_parenthesized_cell_continuation(
@@ -704,6 +786,60 @@ mod tests {
       ]
     );
     assert!(paths.iter().all(|candidate| candidate.spans.len() == 2));
+  }
+
+  #[test]
+  fn joins_parenthesized_metrics_urls_across_table_cell_lines() {
+    let input = concat!(
+      "  Summary  P90 (https://metrics.example/plot#now-1h,China-             same\n",
+      "           North6,false;max:stage.ms%7Bcar\n",
+      "           d_type=*%7D%7Bstage=literal_or(summary),status=literal_or(\n",
+      "           success)%7D%5Bpct90%5D;0) / AVG (https://metrics.example/plot#now-\n",
+      "           1h,China-North6,false;avg:stage.ms%7Bstage=literal_or(summary)\n",
+      "           %7D%5Bavg%5D;0)\n",
+    );
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let custom = vec![];
+    let results = State::new(&lines, "abcd", &custom, Some(120)).matches(false, false);
+    let urls = results
+      .iter()
+      .filter(|candidate| candidate.pattern == "url")
+      .collect::<Vec<_>>();
+
+    assert_eq!(
+      urls.iter().map(|candidate| candidate.text.as_str()).collect::<Vec<_>>(),
+      [
+        "https://metrics.example/plot#now-1h,China-North6,false;max:stage.ms%7Bcard_type=*%7D%7Bstage=literal_or(summary),status=literal_or(success)%7D%5Bpct90%5D;0",
+        "https://metrics.example/plot#now-1h,China-North6,false;avg:stage.ms%7Bstage=literal_or(summary)%7D%5Bavg%5D;0",
+      ]
+    );
+    assert_eq!(urls[0].spans.len(), 4);
+    assert_eq!(urls[1].spans.len(), 3);
+  }
+
+  #[test]
+  fn rejects_ambiguous_parenthesized_table_url_continuations() {
+    let cases = [
+      "row (https://host/path-\n     continuation-without-close",
+      "row (https://host/path-\n       wrong-column)",
+      "row (https://host/path-\n\n     continuation)",
+      "row (https://host/path-\n     https://independent.example/next)",
+      "row (https://host/path-\n  ─────────────────────",
+    ];
+
+    for input in cases {
+      let lines = input.split('\n').collect::<Vec<_>>();
+      let custom = vec![];
+      let results = State::new(&lines, "abcd", &custom, Some(120)).matches(false, false);
+      assert!(
+        results
+          .iter()
+          .filter(|candidate| candidate.pattern == "url")
+          .all(|candidate| candidate.spans.len() == 1),
+        "{:?}",
+        input
+      );
+    }
   }
 
   #[test]
