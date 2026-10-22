@@ -170,6 +170,12 @@ grep -Fq "${ROOT_DIR}/tmux-thumbs.sh" <<<"${prefix_binding}" \
   }
 grep -Fq '#{pane_id}' <<<"${prefix_binding}" \
   || fail 'plugin reload did not bind the invoking pane ID'
+expected_shell_command="run-shell -b \"${ROOT_DIR}/tmux-thumbs.sh '#{pane_id}'\""
+grep -Fq "${expected_shell_command}" <<<"${prefix_binding}" \
+  || {
+    printf '%s\n%s\n' "${alias_state}" "${prefix_binding}" >&2
+    fail 'plugin binding split the pane ID from the run-shell command'
+  }
 if grep -Fq '/tmp/old-tmux-thumbs.sh' <<<"${prefix_binding}"; then
   fail 'plugin reload kept a stale thumbs-pick command alias'
 fi
