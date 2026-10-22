@@ -8,6 +8,12 @@ RELEASE_DIR="${CURRENT_DIR}/target/release"
 THUMBS_BINARY="${RELEASE_DIR}/thumbs"
 TMUX_THUMBS_BINARY="${RELEASE_DIR}/tmux-thumbs"
 VERSION=$(grep 'version =' "${CURRENT_DIR}/Cargo.toml" | grep -o "\".*\"" | sed 's/"//g')
+SOURCE_PANE="${1:-}"
+
+if [ -z "${SOURCE_PANE}" ]; then
+  tmux display-message 'tmux-thumbs: source pane unavailable; retry'
+  exit 0
+fi
 
 if [ ! -f "$THUMBS_BINARY" ]; then
   tmux split-window "cd ${CURRENT_DIR} && bash ./tmux-thumbs-install.sh"
@@ -35,7 +41,7 @@ function get-opt-arg() {
   fi
 }
 
-PARAMS=(--dir "${CURRENT_DIR}")
+PARAMS=(--dir "${CURRENT_DIR}" --pane-id "${SOURCE_PANE}")
 
 function add-param() {
   local type opt arg

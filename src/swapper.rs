@@ -1182,6 +1182,13 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .default_value(""),
     )
     .arg(
+      Arg::with_name("pane_id")
+        .help("Source tmux pane to capture")
+        .long("pane-id")
+        .takes_value(true)
+        .required(true),
+    )
+    .arg(
       Arg::with_name("command")
         .help("Command to execute after choose a hint")
         .long("command")
@@ -1210,6 +1217,7 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
 
 fn main() -> std::io::Result<()> {
   let args = app_args();
+  let source_pane_id = args.value_of("pane_id").unwrap();
   let dir = args.value_of("dir").unwrap();
   let command = args.value_of("command").unwrap();
   let upcase_command = args.value_of("upcase_command").unwrap();
@@ -1223,7 +1231,7 @@ fn main() -> std::io::Result<()> {
   let mut executor = RealShell::new();
   let mut swapper = Swapper::new(
     Box::new(&mut executor),
-    String::new(),
+    source_pane_id.to_string(),
     dir.to_string(),
     command.to_string(),
     upcase_command.to_string(),

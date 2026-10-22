@@ -8,6 +8,7 @@ TMP_DIR="$(mktemp -d /tmp/tmux-thumbs-copy-snapshot.XXXXXX)"
 RUNTIME_TMP_DIR="${TMP_DIR}/runtime space;quote's"
 REAL_TMUX="$(command -v tmux)"
 VISIBLE_TARGET='/tmp/visible-target.txt'
+LIVE_TARGET='/tmp/live-target.txt'
 mkdir -m 700 "${RUNTIME_TMP_DIR}"
 
 cleanup() {
@@ -42,6 +43,19 @@ cat >"${TMP_DIR}/tmux" <<'SH'
 set -euo pipefail
 
 case "${1:-}" in
+  display-message)
+    if [ "${TMUX_THUMBS_DROP_SCROLL:-0}" = 1 ] && [[ "$*" == *'#{pane_mode}'* ]]; then
+      output="$("${REAL_TMUX}" "$@")"
+      IFS=: read -r pane mode height width _scroll history zoom <<<"${output}"
+      printf '%s:%s:%s:%s::%s:%s\n' "${pane}" "${mode}" "${height}" "${width}" "${history}" "${zoom}"
+      exit 0
+    fi
+    if [[ "$*" == *'tmux-thumbs: copy-mode viewport unavailable; retry'* ]]; then
+      "${REAL_TMUX}" set-buffer -b tmux-thumbs-test-message 'tmux-thumbs: copy-mode viewport unavailable; retry'
+      exit 0
+    fi
+    exec "${REAL_TMUX}" "$@"
+    ;;
   capture-pane)
     sleep 0.20
     exec "${REAL_TMUX}" "$@"
@@ -58,7 +72,7 @@ esac
 SH
 chmod 700 "${TMP_DIR}/tmux"
 
-python_code=$'import time\nfor i in range(1, 201):\n    marker = "/tmp/visible-target.txt " if i == 15 else "/tmp/drift-target.txt " if i == 19 else ""\n    print(f"L{i:03d} " + marker + "x" * 140, flush=True)\ntime.sleep(120)'
+python_code=$'import time\nfor i in range(1, 201):\n    marker = "/tmp/visible-target.txt " if i == 15 else "/tmp/drift-target.txt " if i == 19 else "/tmp/live-target.txt " if i == 200 else ""\n    print(f"L{i:03d} " + marker + "x" * 140, flush=True)\ntime.sleep(120)'
 printf -v source_command 'python3 -c %q' "${python_code}"
 
 "${REAL_TMUX}" -L "${SOCKET_NAME}" -f /dev/null new-session -d -x 120 -y 30 \
@@ -83,7 +97,7 @@ visible_before="$("${REAL_TMUX}" -L "${SOCKET_NAME}" capture-pane -p -N -t "${SO
 grep -Fq 'L015' <<<"${visible_before}" || fail 'fixture did not position L015 on the visible copy-mode page'
 grep -Fq "${VISIBLE_TARGET}" <<<"${visible_before}" || fail 'fixture target is not visible before invoking tmux-thumbs'
 
-launcher="PATH=$(printf '%q' "${TMP_DIR}:${PATH}") REAL_TMUX=$(printf '%q' "${REAL_TMUX}") TMPDIR=$(printf '%q' "${RUNTIME_TMP_DIR}") $(printf '%q' "${ROOT_DIR}/target/release/tmux-thumbs") --dir $(printf '%q' "${ROOT_DIR}")"
+launcher="PATH=$(printf '%q' "${TMP_DIR}:${PATH}") REAL_TMUX=$(printf '%q' "${REAL_TMUX}") TMPDIR=$(printf '%q' "${RUNTIME_TMP_DIR}") $(printf '%q' "${ROOT_DIR}/target/release/tmux-thumbs") --pane-id $(printf '%q' "${SOURCE_PANE}") --dir $(printf '%q' "${ROOT_DIR}")"
 "${REAL_TMUX}" -L "${SOCKET_NAME}" run-shell -b -t "${SOURCE_PANE}" "${launcher}"
 
 thumbs_is_running() {
@@ -113,8 +127,31 @@ if ! grep -Fq 'L015 ' <<<"${overlay}"; then
   wait_until 'snapshot cleanup after failed assertion' runtime_dir_is_empty
   fail 'overlay drifted away from the pre-swap copy-mode page'
 fi
+if grep -Fq "${LIVE_TARGET}" <<<"${overlay}"; then
+  printf '%s\n' "${overlay}" >&2
+  "${REAL_TMUX}" -L "${SOCKET_NAME}" send-keys -t "${THUMBS_PANE}" q
+  wait_until 'source pane restoration after live-page assertion' source_pane_is_restored
+  wait_until 'snapshot cleanup after live-page assertion' runtime_dir_is_empty
+  fail 'overlay captured the live page instead of the visible copy-mode page'
+fi
 
 "${REAL_TMUX}" -L "${SOCKET_NAME}" send-keys -t "${THUMBS_PANE}" q
 wait_until 'source pane restoration' source_pane_is_restored
 wait_until 'snapshot cleanup' runtime_dir_is_empty
+
+invalid_launcher="PATH=$(printf '%q' "${TMP_DIR}:${PATH}") REAL_TMUX=$(printf '%q' "${REAL_TMUX}") TMPDIR=$(printf '%q' "${RUNTIME_TMP_DIR}") TMUX_THUMBS_DROP_SCROLL=1 $(printf '%q' "${ROOT_DIR}/target/release/tmux-thumbs") --pane-id $(printf '%q' "${SOURCE_PANE}") --dir $(printf '%q' "${ROOT_DIR}")"
+"${REAL_TMUX}" -L "${SOCKET_NAME}" run-shell -b -t "${SOURCE_PANE}" "${invalid_launcher}"
+
+viewport_message_present() {
+  "${REAL_TMUX}" -L "${SOCKET_NAME}" show-buffer -b tmux-thumbs-test-message 2>/dev/null \
+    | grep -Fxq 'tmux-thumbs: copy-mode viewport unavailable; retry'
+}
+wait_until 'copy-mode viewport retry message' viewport_message_present
+
+if "${REAL_TMUX}" -L "${SOCKET_NAME}" list-windows -F '#{window_name}' | grep -Fxq '[thumbs]'; then
+  fail 'invalid copy-mode viewport opened a picker window'
+fi
+test "$("${REAL_TMUX}" -L "${SOCKET_NAME}" list-panes -t "${SOURCE_WINDOW}" -F '#{pane_id}')" = "${SOURCE_PANE}" \
+  || fail 'invalid viewport replaced the source pane'
+wait_until 'invalid viewport snapshot cleanup' runtime_dir_is_empty
 printf 'copy-mode snapshot test: ok\n'
