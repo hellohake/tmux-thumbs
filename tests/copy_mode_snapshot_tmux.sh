@@ -154,4 +154,24 @@ fi
 test "$("${REAL_TMUX}" -L "${SOCKET_NAME}" list-panes -t "${SOURCE_WINDOW}" -F '#{pane_id}')" = "${SOURCE_PANE}" \
   || fail 'invalid viewport replaced the source pane'
 wait_until 'invalid viewport snapshot cleanup' runtime_dir_is_empty
+
+"${REAL_TMUX}" -L "${SOCKET_NAME}" set-option -ag command-alias \
+  'thumbs-pick=run-shell -b /tmp/old-tmux-thumbs.sh'
+"${REAL_TMUX}" -L "${SOCKET_NAME}" set-option -g @thumbs-key f
+"${REAL_TMUX}" -L "${SOCKET_NAME}" bind-key -T prefix f thumbs-pick
+"${REAL_TMUX}" -L "${SOCKET_NAME}" run-shell -t "${SOURCE_PANE}" \
+  "PATH=$(printf '%q' "${TMP_DIR}:${PATH}") REAL_TMUX=$(printf '%q' "${REAL_TMUX}") bash $(printf '%q' "${ROOT_DIR}/tmux-thumbs.tmux")"
+prefix_binding="$(${REAL_TMUX} -L "${SOCKET_NAME}" list-keys -T prefix | grep '^bind-key.* f ' || true)"
+alias_state="$(${REAL_TMUX} -L "${SOCKET_NAME}" show-options -s command-alias)"
+grep -Fq "${ROOT_DIR}/tmux-thumbs.sh" <<<"${prefix_binding}" \
+  || {
+    printf '%s\n%s\n' "${alias_state}" "${prefix_binding}" >&2
+    fail 'plugin reload did not bind the current tmux-thumbs script'
+  }
+grep -Fq '#{pane_id}' <<<"${prefix_binding}" \
+  || fail 'plugin reload did not bind the invoking pane ID'
+if grep -Fq '/tmp/old-tmux-thumbs.sh' <<<"${prefix_binding}"; then
+  fail 'plugin reload kept a stale thumbs-pick command alias'
+fi
+
 printf 'copy-mode snapshot test: ok\n'
