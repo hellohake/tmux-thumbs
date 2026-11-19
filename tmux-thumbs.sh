@@ -7,7 +7,14 @@ RELEASE_DIR="${CURRENT_DIR}/target/release"
 
 THUMBS_BINARY="${RELEASE_DIR}/thumbs"
 TMUX_THUMBS_BINARY="${RELEASE_DIR}/tmux-thumbs"
-VERSION=$(grep 'version =' "${CURRENT_DIR}/Cargo.toml" | grep -o "\".*\"" | sed 's/"//g')
+VERSION=$(awk '
+  /^[[:space:]]*\[package\][[:space:]]*(#.*)?$/ { in_package = 1; next }
+  /^[[:space:]]*\[/ { in_package = 0 }
+  in_package && /^[[:space:]]*version[[:space:]]*=/ && match($0, /"[^"]+"/) {
+    print substr($0, RSTART + 1, RLENGTH - 2)
+    exit
+  }
+' "${CURRENT_DIR}/Cargo.toml")
 SOURCE_PANE="${1:-}"
 
 if [ -z "${SOURCE_PANE}" ]; then
