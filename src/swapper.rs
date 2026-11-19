@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width_clusters::UnicodeWidthStr;
 
 trait Executor {
   fn execute(&mut self, args: Vec<String>) -> String;
@@ -65,7 +67,12 @@ fn shell_quote(value: &str) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Viewport {
   Live,
-  CopyMode { scroll_position: i32 },
+  CopyMode {
+    scroll_position: i32,
+    cursor_x: usize,
+    cursor_y: usize,
+    rectangle: bool,
+  },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +92,7 @@ enum SnapshotError {
   PaneChanged,
   SourcePaneUnavailable,
   ViewportUnavailable,
+  SelectionPresent,
 }
 
 impl PaneState {
@@ -97,17 +105,57 @@ impl PaneState {
       return false;
     }
 
-    match (&self.viewport, &other.viewport) {
-      (Viewport::Live, Viewport::Live) => true,
-      (
-        Viewport::CopyMode {
-          scroll_position: before,
-        },
-        Viewport::CopyMode { scroll_position: after },
-      ) => before == after && self.history_size == other.history_size,
-      _ => false,
-    }
+    // Copy-mode owns a frozen backing grid. The live pane's history may grow
+    // independently without changing that viewport.
+    self.viewport == other.viewport
   }
+}
+
+// pipe-no-clear joins terminal soft wraps. Recover their physical rows using
+// display columns, preserving explicit newlines and wide-character padding.
+fn physical_rows(joined: &str, width: usize, height: usize) -> String {
+  let mut rows = Vec::new();
+  for line in joined.split('\n') {
+    let mut row = String::new();
+    let mut column = 0;
+    for glyph in line.graphemes(true) {
+      let glyph_width = glyph.width();
+      if glyph_width > 0 && column + glyph_width > width {
+        row.extend(std::iter::repeat(' ').take(width.saturating_sub(column)));
+        rows.push(row);
+        row = String::new();
+        column = 0;
+      }
+      row.push_str(glyph);
+      column += glyph_width;
+    }
+    rows.push(row);
+  }
+  rows.truncate(height);
+  rows.resize(height, String::new());
+  rows.join("\n") + "\n"
+}
+
+fn move_copy_cursor_to_column(pane_id: &str, column: usize, width: usize) -> Vec<String> {
+  let pane = shell_quote(pane_id);
+  // Vertical motion can restore tmux's hidden preferred column even after
+  // top-line. Reset horizontally without start-of-line, which walks backward
+  // across soft wraps and would change the physical row we just restored.
+  let reset = format!(
+    "if-shell -F -t {} {} {}",
+    pane,
+    shell_quote("#{e|>:#{copy_cursor_x},0}"),
+    shell_quote(&format!("send-keys -t {} -X cursor-left", pane)),
+  );
+  let advance = format!(
+    "if-shell -F -t {} {} {}",
+    pane,
+    shell_quote(&format!("#{{e|<:#{{copy_cursor_x}},{}}}", column)),
+    shell_quote(&format!("send-keys -t {} -X cursor-right", pane)),
+  );
+  let mut commands = vec![reset; width];
+  commands.extend(std::iter::repeat(advance).take(column));
+  commands
 }
 
 #[allow(dead_code)]
@@ -132,7 +180,9 @@ pub struct Swapper<'a> {
   osc52: bool,
   active_pane_id: Option<String>,
   active_pane_width: Option<usize>,
+  active_pane_height: Option<i32>,
   active_pane_zoomed: Option<bool>,
+  active_viewport: Option<Viewport>,
   thumbs_pane_id: Option<String>,
   content: Option<String>,
   signal: String,
@@ -175,7 +225,9 @@ impl<'a> Swapper<'a> {
       osc52,
       active_pane_id: None,
       active_pane_width: None,
+      active_pane_height: None,
       active_pane_zoomed: None,
+      active_viewport: None,
       thumbs_pane_id: None,
       content: None,
       signal,
@@ -191,7 +243,7 @@ impl<'a> Swapper<'a> {
       "-p".to_string(),
       "-t".to_string(),
       self.source_pane_id.clone(),
-      "#{pane_id}:#{pane_mode}:#{pane_height}:#{pane_width}:#{scroll_position}:#{history_size}:#{window_zoomed_flag}"
+      "#{pane_id}:#{pane_mode}:#{pane_height}:#{pane_width}:#{scroll_position}:#{history_size}:#{window_zoomed_flag}:#{copy_cursor_x}:#{copy_cursor_y}:#{rectangle_toggle}:#{selection_start_x}"
         .to_string(),
     ];
     let output = self.executor.execute(state_command);
@@ -200,7 +252,7 @@ impl<'a> Swapper<'a> {
     }
 
     let fields = output.split(':').collect::<Vec<_>>();
-    if fields.len() != 7 || fields[0] != self.source_pane_id {
+    if fields.len() != 11 || fields[0] != self.source_pane_id {
       return Err(SnapshotError::SourcePaneUnavailable);
     }
 
@@ -212,7 +264,17 @@ impl<'a> Swapper<'a> {
           .ok()
           .filter(|value| *value >= 0)
           .ok_or(SnapshotError::ViewportUnavailable)?;
-        Viewport::CopyMode { scroll_position }
+        if !fields[10].is_empty() {
+          return Err(SnapshotError::SelectionPresent);
+        }
+        let cursor_x = fields[7].parse().map_err(|_| SnapshotError::ViewportUnavailable)?;
+        let cursor_y = fields[8].parse().map_err(|_| SnapshotError::ViewportUnavailable)?;
+        Viewport::CopyMode {
+          scroll_position,
+          cursor_x,
+          cursor_y,
+          rectangle: fields[9] == "1",
+        }
       }
       _ => return Err(SnapshotError::ViewportUnavailable),
     };
@@ -233,7 +295,9 @@ impl<'a> Swapper<'a> {
   fn use_pane_state(&mut self, state: &PaneState) {
     self.active_pane_id = Some(state.pane_id.clone());
     self.active_pane_width = Some(state.width);
+    self.active_pane_height = Some(state.height);
     self.active_pane_zoomed = Some(state.zoomed);
+    self.active_viewport = Some(state.viewport);
   }
 
   pub fn capture_active_pane(&mut self) {
@@ -255,7 +319,9 @@ impl<'a> Swapper<'a> {
     builder.mode(0o700);
     builder.create(&self.runtime_dir)?;
     let result = Self::prepare_snapshot_file(&self.snapshot_path("screen"))
-      .and_then(|_| Self::prepare_snapshot_file(&self.snapshot_path("joined")));
+      .and_then(|_| Self::prepare_snapshot_file(&self.snapshot_path("joined")))
+      .and_then(|_| Self::prepare_snapshot_file(&self.snapshot_path("copy-commands")))
+      .and_then(|_| Self::prepare_snapshot_file(&self.snapshot_path("restore-commands")));
     if result.is_err() {
       self.cleanup_runtime_dir();
     }
@@ -267,6 +333,15 @@ impl<'a> Swapper<'a> {
   }
 
   fn capture_snapshot_files(&mut self, state: &PaneState) -> bool {
+    if let Viewport::CopyMode {
+      cursor_x,
+      cursor_y,
+      rectangle,
+      ..
+    } = state.viewport
+    {
+      return self.capture_copy_mode_snapshot(state, cursor_x, cursor_y, rectangle);
+    }
     let screen_path = self.snapshot_path("screen");
     let joined_path = self.snapshot_path("joined");
     let screen_path = screen_path.to_string_lossy().into_owned();
@@ -283,14 +358,6 @@ impl<'a> Swapper<'a> {
       "-t".to_string(),
       state.pane_id.clone(),
     ];
-    if let Viewport::CopyMode { scroll_position } = state.viewport {
-      command.extend([
-        "-S".to_string(),
-        (-scroll_position).to_string(),
-        "-E".to_string(),
-        (state.height - scroll_position - 1).to_string(),
-      ]);
-    }
     command.extend([
       ";".to_string(),
       "capture-pane".to_string(),
@@ -300,14 +367,6 @@ impl<'a> Swapper<'a> {
       "-t".to_string(),
       state.pane_id.clone(),
     ]);
-    if let Viewport::CopyMode { scroll_position } = state.viewport {
-      command.extend([
-        "-S".to_string(),
-        (-scroll_position).to_string(),
-        "-E".to_string(),
-        (state.height - scroll_position - 1).to_string(),
-      ]);
-    }
     command.extend([
       ";".to_string(),
       "save-buffer".to_string(),
@@ -330,6 +389,128 @@ impl<'a> Swapper<'a> {
     ]);
     self.executor.execute(command);
     self.executor.last_succeeded()
+  }
+
+  fn capture_copy_mode_snapshot(
+    &mut self,
+    state: &PaneState,
+    cursor_x: usize,
+    cursor_y: usize,
+    rectangle: bool,
+  ) -> bool {
+    if state.width == 0 || state.height <= 0 || cursor_x > state.width || cursor_y >= state.height as usize {
+      return false;
+    }
+    let joined_path = shell_quote(&self.snapshot_path("joined").to_string_lossy());
+    let ready_path = self.snapshot_path("copy-ready");
+    if !ready_path.exists() && Self::prepare_snapshot_file(&ready_path).is_err() {
+      return false;
+    }
+    if fs::write(&ready_path, b"").is_err() {
+      return false;
+    }
+    let ready_path = shell_quote(&ready_path.to_string_lossy());
+    let pane = shell_quote(&state.pane_id);
+    let send = format!("send-keys -t {} -X", pane);
+    let mut commands = vec![
+      format!("{} top-line", send),
+      format!("{} begin-selection", send),
+      format!("{} rectangle-on", send),
+      format!("{} bottom-line", send),
+    ];
+
+    // cursor-right counts glyphs, not cells. Stop by the actual column so CJK
+    // padding cannot carry the cursor into a row below the visible viewport.
+    commands.extend(move_copy_cursor_to_column(&state.pane_id, state.width, state.width));
+    let pipe = format!("cat > {}; printf '%s' \"$?\" > {}", joined_path, ready_path);
+    commands.push(format!("{} pipe-no-clear {}", send, shell_quote(&pipe)));
+    commands.push(format!("{} clear-selection", send));
+    commands.push(format!("{} rectangle-{}", send, if rectangle { "on" } else { "off" }));
+    commands.push(format!("{} top-line", send));
+    if cursor_y > 0 {
+      commands.push(format!("{} -N {} cursor-down", send, cursor_y));
+    }
+    commands.extend(move_copy_cursor_to_column(&state.pane_id, cursor_x, state.width));
+    let command_path = self.snapshot_path("copy-commands");
+    if fs::write(&command_path, commands.join("\n")).is_err() {
+      return false;
+    }
+
+    // Selection and cursor restoration run in one server command queue before
+    // waiting for the pipe job. pipe-no-clear leaves tmux buffers/clipboard alone.
+    // Bound the wait so a failed pipe job cannot strand the launcher.
+    let script = format!(
+      "set -e; tmux source-file {commands}; for ((attempt=0; attempt<100; attempt++)); do if [ -s {ready} ]; then break; fi; sleep 0.01; done; [ \"$(cat {ready})\" = 0 ]; cat {joined}",
+      commands = shell_quote(&command_path.to_string_lossy()),
+      ready = ready_path,
+      joined = joined_path,
+    );
+    let joined = self
+      .executor
+      .execute(vec!["bash".to_string(), "-c".to_string(), script]);
+    self.executor.last_succeeded()
+      && fs::write(
+        self.snapshot_path("screen"),
+        physical_rows(&joined, state.width, state.height as usize),
+      )
+      .is_ok()
+  }
+
+  fn restore_copy_mode_command(&self) -> Option<String> {
+    let (scroll_position, cursor_x, cursor_y) = match self.active_viewport {
+      Some(Viewport::CopyMode {
+        scroll_position,
+        cursor_x,
+        cursor_y,
+        ..
+      }) => (scroll_position, cursor_x, cursor_y),
+      _ => return Some(String::new()),
+    };
+    let pane_id = self.active_pane_id.as_ref().unwrap();
+    let pane = shell_quote(pane_id);
+    let send = format!("send-keys -t {} -X", pane);
+    let mut commands = Vec::new();
+    // swap-pane temporarily unzooms even with -Z. Its resize callback anchors
+    // the old copy cursor at row zero; restore the original viewport afterward.
+    for (operator, direction, difference) in [
+      ("<", "up", format!("#{{e|-:{},#{{scroll_position}}}}", scroll_position)),
+      (
+        ">",
+        "down",
+        format!("#{{e|-:#{{scroll_position}},{}}}", scroll_position),
+      ),
+    ] {
+      commands.push(format!(
+        "if-shell -F -t {} {} {}",
+        pane,
+        shell_quote(&format!("#{{e|{}:#{{scroll_position}},{}}}", operator, scroll_position)),
+        shell_quote(&format!(
+          "{} -N {} scroll-{}",
+          send,
+          shell_quote(&difference),
+          direction
+        )),
+      ));
+    }
+    commands.push(format!("{} top-line", send));
+    if cursor_y > 0 {
+      commands.push(format!("{} -N {} cursor-down", send, cursor_y));
+    }
+    commands.extend(move_copy_cursor_to_column(
+      pane_id,
+      cursor_x,
+      self.active_pane_width.unwrap(),
+    ));
+    let command_path = self.snapshot_path("restore-commands");
+    if fs::write(&command_path, commands.join("\n")).is_err() {
+      return None;
+    }
+    Some(format!(
+      "tmux if-shell -F -t {} {} {};",
+      pane,
+      shell_quote("#{==:#{pane_mode},copy-mode}"),
+      shell_quote(&format!("source-file {}", shell_quote(&command_path.to_string_lossy()))),
+    ))
   }
 
   fn capture_stable_snapshot(&mut self) -> Result<(), SnapshotError> {
@@ -419,11 +600,7 @@ impl<'a> Swapper<'a> {
     let active_pane_id = self.active_pane_id.as_mut().unwrap().clone();
 
     let active_pane_zoomed = self.active_pane_zoomed.as_mut().unwrap().clone();
-    let zoom_command = if active_pane_zoomed {
-      format!("tmux resize-pane -t {} -Z;", active_pane_id)
-    } else {
-      "".to_string()
-    };
+    let zoom_flag = if active_pane_zoomed { "-Z" } else { "" };
 
     let pane_width_param = self
       .active_pane_width
@@ -434,9 +611,13 @@ impl<'a> Swapper<'a> {
     let joined_path = shell_quote(&self.snapshot_path("joined").to_string_lossy());
     let result_path = shell_quote(&self.tmp_file);
     let thumbs_binary = shell_quote(&format!("{}/target/release/thumbs", self.dir));
+    let restore_command = match self.restore_copy_mode_command() {
+      Some(command) => command,
+      None => return false,
+    };
 
     let pane_command = format!(
-        "umask 077; {thumbs_binary} -f '%U:%H' -t {result_path}{pane_width_param} --joined-capture {joined_path} {args} < {screen_path}; picker_status=$?; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}; exit $picker_status",
+        "tmux wait-for {signal}-start; umask 077; {thumbs_binary} -f '%U:%H' -t {result_path}{pane_width_param} --joined-capture {joined_path} {args} < {screen_path}; picker_status=$?; tmux swap-pane {zoom_flag} -s \"$TMUX_PANE\" -t {active_pane_id}; {restore_command} tmux wait-for -S {signal}; exit $picker_status",
         active_pane_id = active_pane_id,
         thumbs_binary = thumbs_binary,
         result_path = result_path,
@@ -444,7 +625,8 @@ impl<'a> Swapper<'a> {
         screen_path = screen_path,
         joined_path = joined_path,
         args = args.join(" "),
-        zoom_command = zoom_command,
+        zoom_flag = zoom_flag,
+        restore_command = restore_command,
         signal = self.signal
     );
 
@@ -467,14 +649,52 @@ impl<'a> Swapper<'a> {
     }
 
     self.thumbs_pane_id = Some(thumbs_pane_id);
+    // Parking the source in a differently sized window reflows copy-mode and
+    // resets its cursor row. Give that window the source's exact pane size.
+    let picker = self.thumbs_pane_id.as_ref().unwrap().clone();
+    let geometry_command = vec![
+      "tmux".to_string(),
+      "set-window-option".to_string(),
+      "-t".to_string(),
+      picker.clone(),
+      "pane-border-status".to_string(),
+      "off".to_string(),
+      ";".to_string(),
+      "resize-window".to_string(),
+      "-t".to_string(),
+      picker.clone(),
+      "-x".to_string(),
+      self.active_pane_width.unwrap().to_string(),
+      "-y".to_string(),
+      self.active_pane_height.unwrap().to_string(),
+    ];
+    self.executor.execute(geometry_command);
+    if !self.executor.last_succeeded() {
+      self.executor.execute(vec![
+        "tmux".to_string(),
+        "kill-window".to_string(),
+        "-t".to_string(),
+        picker,
+      ]);
+      return false;
+    }
     true
+  }
+
+  pub fn start_thumbs(&mut self) {
+    self.executor.execute(vec![
+      "tmux".to_string(),
+      "wait-for".to_string(),
+      "-S".to_string(),
+      format!("{}-start", self.signal),
+    ]);
   }
 
   pub fn swap_panes(&mut self) {
     let active_pane_id = self.active_pane_id.as_mut().unwrap().clone();
     let thumbs_pane_id = self.thumbs_pane_id.as_mut().unwrap().clone();
 
-    let swap_command = vec![
+    let mut swap_command = vec![
       "tmux",
       "swap-pane",
       "-d",
@@ -483,28 +703,11 @@ impl<'a> Swapper<'a> {
       "-t",
       thumbs_pane_id.as_str(),
     ];
-
-    let params = swap_command
-      .iter()
-      .filter(|&s| !s.is_empty())
-      .map(|arg| arg.to_string())
-      .collect();
-
-    self.executor.execute(params);
-  }
-
-  pub fn resize_pane(&mut self) {
-    let active_pane_zoomed = self.active_pane_zoomed.as_mut().unwrap().clone();
-
-    if !active_pane_zoomed {
-      return;
+    if self.active_pane_zoomed == Some(true) {
+      swap_command.push("-Z");
     }
 
-    let thumbs_pane_id = self.thumbs_pane_id.as_mut().unwrap().clone();
-
-    let resize_command = vec!["tmux", "resize-pane", "-t", thumbs_pane_id.as_str(), "-Z"];
-
-    let params = resize_command
+    let params = swap_command
       .iter()
       .filter(|&s| !s.is_empty())
       .map(|arg| arg.to_string())
@@ -689,11 +892,28 @@ mod tests {
   }
 
   fn copy_state(pane_id: &str, scroll_position: &str, history_size: usize) -> String {
-    format!("{}:copy-mode:24:120:{}:{}:0", pane_id, scroll_position, history_size)
+    format!(
+      "{}:copy-mode:24:120:{}:{}:0:0:0:0:",
+      pane_id, scroll_position, history_size
+    )
   }
 
   fn live_state(pane_id: &str, history_size: usize) -> String {
-    format!("{}::24:120::{}:0", pane_id, history_size)
+    format!("{}::24:120::{}:0::::", pane_id, history_size)
+  }
+
+  #[test]
+  fn reconstructs_physical_rows_without_moving_hard_newlines_or_wide_glyphs() {
+    for (joined, width, height, expected) in [
+      ("abcdef\nxy\n", 4, 4, "abcd\nef\nxy\n\n"),
+      ("abcd\nxy\n", 4, 3, "abcd\nxy\n\n"),
+      ("abc中d\n", 4, 3, "abc \n中d\n\n"),
+      ("a\u{301}bcdx", 4, 2, "a\u{301}bcd\nx\n"),
+      ("ab👩\u{200d}💻cd", 4, 2, "ab👩\u{200d}💻\ncd\n"),
+      ("abc♥\u{fe0f}d", 4, 2, "abc \n♥\u{fe0f}d\n"),
+    ] {
+      assert_eq!(physical_rows(joined, width, height), expected);
+    }
   }
 
   #[test]
@@ -818,7 +1038,7 @@ mod tests {
 
   #[test]
   fn rejects_unsupported_pane_modes() {
-    let mut executor = TestShell::new(vec!["%97:clock-mode:24:120::100:0".to_string()]);
+    let mut executor = TestShell::new(vec!["%97:clock-mode:24:120::100:0::::".to_string()]);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
       "%97".to_string(),
@@ -973,7 +1193,7 @@ mod tests {
     let capture_attempts = executor
       .executed
       .iter()
-      .filter(|command| command.get(1).map(String::as_str) == Some("capture-pane"))
+      .filter(|command| command.first().map(String::as_str) == Some("bash"))
       .count();
     assert_eq!(capture_attempts, 2);
   }
@@ -1008,7 +1228,7 @@ mod tests {
     let capture_attempts = executor
       .executed
       .iter()
-      .filter(|command| command.get(1).map(String::as_str) == Some("capture-pane"))
+      .filter(|command| command.first().map(String::as_str) == Some("bash"))
       .count();
     assert_eq!(capture_attempts, 3);
     assert!(!runtime_dir.exists());
@@ -1036,7 +1256,7 @@ mod tests {
 
   #[test]
   fn passes_pane_width_to_thumbs() {
-    let last_command_outputs = vec!["%100".to_string(), "".to_string()];
+    let last_command_outputs = vec!["".to_string(), "%100".to_string(), "".to_string()];
     let mut executor = TestShell::new(last_command_outputs);
     let mut swapper = Swapper::new(
       Box::new(&mut executor),
@@ -1049,18 +1269,23 @@ mod tests {
     );
     swapper.active_pane_id = Some("%97".to_string());
     swapper.active_pane_width = Some(120);
+    swapper.active_pane_height = Some(24);
     swapper.active_pane_zoomed = Some(false);
 
     swapper.execute_thumbs();
 
-    let command = executor.last_executed().unwrap();
+    let command = executor
+      .executed
+      .iter()
+      .find(|command| command.get(1).map(String::as_str) == Some("new-window"))
+      .unwrap();
     assert!(command.last().unwrap().contains("--pane-width 120"));
   }
 
   #[test]
   fn concurrent_swappers_use_unique_runtime_names() {
-    let mut first_executor = TestShell::new(vec!["%100".to_string(), "".to_string()]);
-    let mut second_executor = TestShell::new(vec!["%101".to_string(), "".to_string()]);
+    let mut first_executor = TestShell::new(vec!["".to_string(), "%100".to_string(), "".to_string()]);
+    let mut second_executor = TestShell::new(vec!["".to_string(), "%101".to_string(), "".to_string()]);
     let mut first = Swapper::new(
       Box::new(&mut first_executor),
       "%97".to_string(),
@@ -1072,10 +1297,18 @@ mod tests {
     );
     first.active_pane_id = Some("%97".to_string());
     first.active_pane_width = Some(120);
+    first.active_pane_height = Some(24);
     first.active_pane_zoomed = Some(false);
     first.execute_thumbs();
     let first_runtime_dir = first.runtime_dir.to_string_lossy().into_owned();
-    let first_command = first_executor.last_executed().unwrap().last().unwrap().clone();
+    let first_command = first_executor
+      .executed
+      .iter()
+      .find(|command| command.get(1).map(String::as_str) == Some("new-window"))
+      .unwrap()
+      .last()
+      .unwrap()
+      .clone();
 
     let mut second = Swapper::new(
       Box::new(&mut second_executor),
@@ -1088,10 +1321,18 @@ mod tests {
     );
     second.active_pane_id = Some("%98".to_string());
     second.active_pane_width = Some(120);
+    second.active_pane_height = Some(24);
     second.active_pane_zoomed = Some(false);
     second.execute_thumbs();
     let second_runtime_dir = second.runtime_dir.to_string_lossy().into_owned();
-    let second_command = second_executor.last_executed().unwrap().last().unwrap().clone();
+    let second_command = second_executor
+      .executed
+      .iter()
+      .find(|command| command.get(1).map(String::as_str) == Some("new-window"))
+      .unwrap()
+      .last()
+      .unwrap()
+      .clone();
 
     assert!(first_command.contains(&first_runtime_dir));
     assert!(second_command.contains(&second_runtime_dir));
@@ -1102,6 +1343,7 @@ mod tests {
   #[test]
   fn swap_panes() {
     let last_command_outputs = vec![
+      "".to_string(),
       "".to_string(),
       "%100".to_string(),
       "".to_string(),
@@ -1119,8 +1361,10 @@ mod tests {
     );
 
     swapper.capture_active_pane();
+    swapper.prepare_runtime_dir().unwrap();
     swapper.execute_thumbs();
     swapper.swap_panes();
+    swapper.cleanup_runtime_dir();
 
     let expectation = vec!["tmux", "swap-pane", "-d", "-s", "%98", "-t", "%100"];
 
@@ -1246,6 +1490,7 @@ fn main() -> std::io::Result<()> {
       SnapshotError::PaneChanged => "tmux-thumbs: pane changed during capture; retry",
       SnapshotError::SourcePaneUnavailable => "tmux-thumbs: source pane unavailable; retry",
       SnapshotError::ViewportUnavailable => "tmux-thumbs: copy-mode viewport unavailable; retry",
+      SnapshotError::SelectionPresent => "tmux-thumbs: clear the copy-mode selection before picking",
     };
     swapper.notify_failure(message);
     return Ok(());
@@ -1256,7 +1501,7 @@ fn main() -> std::io::Result<()> {
     return Ok(());
   }
   swapper.swap_panes();
-  swapper.resize_pane();
+  swapper.start_thumbs();
   swapper.wait_thumbs();
   swapper.retrieve_content();
   swapper.execute_command();

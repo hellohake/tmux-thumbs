@@ -46,8 +46,10 @@ case "${1:-}" in
   display-message)
     if [ "${TMUX_THUMBS_DROP_SCROLL:-0}" = 1 ] && [[ "$*" == *'#{pane_mode}'* ]]; then
       output="$("${REAL_TMUX}" "$@")"
-      IFS=: read -r pane mode height width _scroll history zoom <<<"${output}"
-      printf '%s:%s:%s:%s::%s:%s\n' "${pane}" "${mode}" "${height}" "${width}" "${history}" "${zoom}"
+      IFS=: read -r pane mode height width _scroll history zoom cursor_x cursor_y rectangle selection <<<"${output}"
+      printf '%s:%s:%s:%s::%s:%s:%s:%s:%s:%s\n' \
+        "${pane}" "${mode}" "${height}" "${width}" "${history}" "${zoom}" \
+        "${cursor_x}" "${cursor_y}" "${rectangle}" "${selection}"
       exit 0
     fi
     if [[ "$*" == *'tmux-thumbs: copy-mode viewport unavailable; retry'* ]]; then

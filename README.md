@@ -403,6 +403,12 @@ If you run standalone `thumbs` with multi selection mode (-m) you will be able t
 
 ## Tmux compatibility
 
+Copy-mode viewport preservation is tested with tmux 3.5a, including background
+output, Chinese text, emoji, soft wraps, split panes and zoomed windows. The picker
+exports copy-mode's frozen viewport and restores its cursor and scroll position
+on exit. Clear an existing copy-mode selection before opening the picker; it
+leaves existing selections and clipboard contents intact when refusing to open.
+
 This is the known list of versions of `tmux` compatible with `tmux-thumbs`:
 
 | Version | Compatible |
